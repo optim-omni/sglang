@@ -279,14 +279,18 @@ class CudaGraphRunner:
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
             or model_runner.spec_algorithm.is_ngram()
+            or model_runner.spec_algorithm.is_dflash()
         ):
-            if self.model_runner.is_draft_worker:
-                raise RuntimeError("This should not happen")
-            else:
-                self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-                self.num_tokens_per_bs = (
-                    self.model_runner.server_args.speculative_num_draft_tokens
-                )
+            # EAGLE/standalone/ngram draft workers use separate cuda-graph runners;
+            # do not capture TARGET_VERIFY graphs here. DFLASH draft uses a fixed-size
+            # block and reuses TARGET_VERIFY graphs for both target and draft.
+            if not model_runner.spec_algorithm.is_dflash():
+                if self.model_runner.is_draft_worker:
+                    raise RuntimeError("This should not happen")
+            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
+            self.num_tokens_per_bs = (
+                self.model_runner.server_args.speculative_num_draft_tokens
+            )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -294,6 +298,17 @@ class CudaGraphRunner:
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
+        # DFLASH target model: capture graphs with FULL hidden mode so output
+        # buffers are sized for aux_hidden_states (num_layers * hidden_size).
+        self._dflash_target_skip_graph = False
+        if (
+            model_runner.spec_algorithm.is_dflash()
+            and not model_runner.is_draft_worker
+        ):
+            if getattr(model_runner, 'eagle_use_aux_hidden_state', False):
+                self.capture_hidden_mode = CaptureHiddenMode.FULL
+            # TARGET_VERIFY uses prefill wrappers (original sglang design).
+            # capture_forward_mode stays TARGET_VERIFY (set above at line 290).
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
@@ -432,12 +447,23 @@ class CudaGraphRunner:
             else True
         )
 
+        # MiniCPMSparseBackend's forward_verify has a Python loop with per-iteration
+        # metadata rebuilds that cannot be captured in CUDA graph. Skip graph for
+        # TARGET_VERIFY when using this backend; decode still uses CUDA graph.
+        is_verify_compatible = True
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and self._dflash_target_skip_graph
+        ):
+            is_verify_compatible = False
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_verify_compatible
         )
 
     def _init_profile_context_and_memory_record(self):
@@ -706,6 +732,13 @@ class CudaGraphRunner:
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(
                     {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                 )
+            # DFLASH draft worker requires input_embeds instead of input_ids
+            if (
+                self.model_runner.spec_algorithm.is_dflash()
+                and self.model_runner.is_draft_worker
+                and "input_embeds" in inspect.signature(forward).parameters
+            ):
+                kwargs["input_embeds"] = buffers.input_embeds[:num_tokens]
 
             logits_output_or_pp_proxy_tensors = forward(
                 input_ids,
@@ -759,8 +792,10 @@ class CudaGraphRunner:
             capture_hidden_mode_required_for_returning_hidden_states,
         )
 
-        # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
-        if self.capture_hidden_mode != required_capture_hidden_mode:
+        # Only UPGRADE capture_hidden_mode, never downgrade.
+        # FULL can emulate NULL/LAST (just ignore extra hidden output),
+        # but NULL cannot serve FULL (output buffers too small).
+        if required_capture_hidden_mode > self.capture_hidden_mode:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
@@ -810,6 +845,14 @@ class CudaGraphRunner:
                 num_token_non_padded=len(forward_batch.input_ids),
                 spec_info=forward_batch.spec_info,
             )
+        # Copy input_embeds for DFLASH draft worker
+        if (
+            self.model_runner.spec_algorithm.is_dflash()
+            and self.model_runner.is_draft_worker
+            and forward_batch.input_embeds is not None
+        ):
+            buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
+
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
         # Attention backend
@@ -875,6 +918,9 @@ class CudaGraphRunner:
                     else None
                 ),
             )
+        elif isinstance(output, torch.Tensor):
+            # DFLASH draft model returns raw hidden states tensor
+            return output[: self.raw_num_token]
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
@@ -905,6 +951,17 @@ class CudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
+
+        elif self.model_runner.spec_algorithm.is_dflash():
+            from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+            spec_info = DFlashVerifyInput(
+                draft_token=None,
+                custom_mask=None,
+                positions=None,
+                draft_token_num=self.num_tokens_per_bs,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
 
         elif self.model_runner.spec_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput

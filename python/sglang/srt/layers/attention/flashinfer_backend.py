@@ -447,20 +447,76 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.prefill_wrappers_paged, False, False
             )
         elif forward_batch.forward_mode.is_target_verify():
-            self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_cpu,
-                forward_batch.seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrappers=self.prefill_wrappers_verify,
-                use_ragged=False,
-                encoder_lens=forward_batch.encoder_lens,
-                spec_info=forward_batch.spec_info,
+            # Check if we should use prefill verify (original) or decode verify
+            import os
+            use_prefill_verify = os.environ.get("SGLANG_PREFILL_VERIFY", "0") == "1"
+            if use_prefill_verify:
+                self.indices_updater_prefill.update(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_cpu,
+                    forward_batch.seq_lens_sum,
+                    prefix_lens=None,
+                    prefill_wrappers=self.prefill_wrappers_verify,
+                    use_ragged=False,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=forward_batch.spec_info,
+                )
+                self.forward_metadata = PrefillMetadata(
+                    self.prefill_wrappers_verify, False, False
+                )
+                return
+
+            # Decode-style verify: flatten D draft tokens into N*D virtual decode
+            # requests using decode kernel for numerical consistency with normal decode.
+            # FlashInfer prefill/decode kernels produce different results for MiniCPM-SALA.
+            spec_info = forward_batch.spec_info
+            draft_token_num = spec_info.draft_token_num
+            bs = len(forward_batch.req_pool_indices)
+            flat_bs = bs * draft_token_num
+
+            offsets = torch.arange(
+                1, draft_token_num + 1,
+                device=forward_batch.seq_lens.device,
+                dtype=forward_batch.seq_lens.dtype,
             )
-            self.forward_metadata = PrefillMetadata(
-                self.prefill_wrappers_verify, False, False
+            flat_seq_lens = (
+                forward_batch.seq_lens.unsqueeze(1) + offsets.unsqueeze(0)
+            ).reshape(-1)
+            flat_req_pool_indices = forward_batch.req_pool_indices.repeat_interleave(
+                draft_token_num
             )
+
+            from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+            kv_indptr = torch.zeros(flat_bs + 1, dtype=torch.int32, device="cuda")
+            kv_indptr[1:] = torch.cumsum(flat_seq_lens.int(), dim=0)
+            kv_indices = torch.empty(
+                int(flat_seq_lens.sum().item()), dtype=torch.int32, device="cuda"
+            )
+            req_to_token = forward_batch.req_to_token_pool.req_to_token
+            create_flashinfer_kv_indices_triton[(flat_bs,)](
+                req_to_token, flat_req_pool_indices, flat_seq_lens.int(),
+                kv_indptr, None, kv_indices, req_to_token.shape[1],
+            )
+
+            verify_decode_wrappers = []
+            for i in range(self.num_wrappers):
+                wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                    self.workspace_buffer, "NHD",
+                    use_tensor_cores=self.decode_use_tensor_cores,
+                )
+                wrapper.begin_forward(
+                    kv_indptr, kv_indices,
+                    torch.ones(flat_bs, dtype=torch.int32, device="cuda"),
+                    self.indices_updater_decode.num_qo_heads,
+                    self.indices_updater_decode.num_kv_heads,
+                    self.indices_updater_decode.head_dim, 1,
+                    data_type=self.indices_updater_decode.data_type,
+                    q_data_type=self.indices_updater_decode.q_data_type,
+                    non_blocking=True,
+                )
+                verify_decode_wrappers.append(wrapper)
+            self.forward_metadata = DecodeMetadata(verify_decode_wrappers)
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
@@ -529,6 +585,18 @@ class FlashInferAttnBackend(AttentionBackend):
             if len(self.cuda_graph_kv_indices[i]) > 0:
                 self.cuda_graph_kv_indices[i][0] = 0
 
+        # Pre-allocate buffers for decode-style verify (N*D virtual decode requests)
+        # max_num_tokens for verify = max_bs * draft_token_num
+        verify_flat_max = max_num_tokens  # Already scaled by num_tokens_per_bs
+        self.verify_kv_indptr = [
+            torch.zeros(verify_flat_max + 1, dtype=torch.int32, device="cuda")
+            for _ in range(self.num_wrappers)
+        ]
+        self.verify_kv_last_page_len = torch.ones(
+            verify_flat_max, dtype=torch.int32, device="cuda"
+        )
+        # kv_indices reuse cuda_graph_kv_indices (already large enough)
+
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
                 (max_num_tokens * self.max_context_len),
@@ -583,35 +651,55 @@ class FlashInferAttnBackend(AttentionBackend):
                     fast_decode_plan, decode_wrappers[i]
                 )
         elif forward_mode.is_target_verify():
-            prefill_wrappers = []
+            # Decode-style verify CUDA graph: N*D virtual decode requests
+            draft_token_num = num_tokens // bs if bs > 0 else 1
+            flat_bs = num_tokens
+
+            decode_wrappers = []
             for i in range(self.num_wrappers):
-                prefill_wrappers.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
+                decode_wrappers.append(
+                    BatchDecodeWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
                         use_cuda_graph=True,
-                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
-                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
-                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                        custom_mask_buf=self.cuda_graph_custom_mask,
-                        mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                        use_tensor_cores=self.decode_use_tensor_cores,
+                        paged_kv_indptr_buffer=self.verify_kv_indptr[i][: flat_bs + 1],
+                        paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buffer=self.verify_kv_last_page_len[:flat_bs],
                     )
                 )
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_prefill.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
-                seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrappers=prefill_wrappers,
-                use_ragged=False,
-                encoder_lens=encoder_lens,
-                spec_info=spec_info,
+
+            offsets = torch.arange(1, draft_token_num + 1, device=seq_lens.device, dtype=seq_lens.dtype)
+            flat_seq_lens = (seq_lens.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1)
+            flat_req_pool_indices = req_pool_indices.repeat_interleave(draft_token_num)
+
+            from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+            kv_indptr = self.verify_kv_indptr[0][: flat_bs + 1]
+            kv_indptr[0] = 0
+            kv_indptr[1:] = torch.cumsum(flat_seq_lens.int(), dim=0)
+            create_flashinfer_kv_indices_triton[(flat_bs,)](
+                self.indices_updater_decode.req_to_token, flat_req_pool_indices,
+                flat_seq_lens.int(), kv_indptr, None,
+                self.cuda_graph_kv_indices[0], self.indices_updater_decode.req_to_token.shape[1],
             )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
-            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+
+            for i, wrapper in enumerate(decode_wrappers):
+                wrapper.begin_forward(
+                    self.verify_kv_indptr[i][: flat_bs + 1],
+                    self.cuda_graph_kv_indices[i],
+                    self.verify_kv_last_page_len[:flat_bs],
+                    self.indices_updater_decode.num_qo_heads,
+                    self.indices_updater_decode.num_kv_heads,
+                    self.indices_updater_decode.head_dim, 1,
+                    data_type=self.indices_updater_decode.data_type,
+                    q_data_type=self.indices_updater_decode.q_data_type,
+                    non_blocking=True,
+                )
+
+            self.decode_cuda_graph_metadata[bs] = decode_wrappers
+            self.forward_metadata = DecodeMetadata(decode_wrappers)
+            for i in range(self.num_wrappers):
+                decode_wrappers[i].begin_forward = partial(fast_decode_plan, decode_wrappers[i])
         elif forward_mode.is_draft_extend():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
@@ -699,17 +787,36 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
         elif forward_mode.is_target_verify():
-            self.indices_updater_prefill.update(
-                req_pool_indices[:bs],
-                seq_lens[:bs],
-                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
-                seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=False,
-                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
-                spec_info=spec_info,
+            # Decode-style verify replay
+            draft_token_num = spec_info.draft_token_num if spec_info else 1
+            flat_bs = bs * draft_token_num
+            offsets = torch.arange(1, draft_token_num + 1, device=seq_lens.device, dtype=seq_lens.dtype)
+            flat_seq_lens = (seq_lens[:bs].unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1)
+            flat_req_pool_indices = req_pool_indices[:bs].repeat_interleave(draft_token_num)
+
+            from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+            kv_indptr = self.verify_kv_indptr[0][: flat_bs + 1]
+            kv_indptr[0] = 0
+            kv_indptr[1:] = torch.cumsum(flat_seq_lens.int(), dim=0)
+            create_flashinfer_kv_indices_triton[(flat_bs,)](
+                self.indices_updater_decode.req_to_token, flat_req_pool_indices,
+                flat_seq_lens.int(), kv_indptr, None,
+                self.cuda_graph_kv_indices[0], self.indices_updater_decode.req_to_token.shape[1],
             )
+
+            wrappers = self.decode_cuda_graph_metadata[bs]
+            for i, wrapper in enumerate(wrappers):
+                wrapper.begin_forward(
+                    self.verify_kv_indptr[i][: flat_bs + 1],
+                    self.cuda_graph_kv_indices[i],
+                    self.verify_kv_last_page_len[:flat_bs],
+                    self.indices_updater_decode.num_qo_heads,
+                    self.indices_updater_decode.num_kv_heads,
+                    self.indices_updater_decode.head_dim, 1,
+                    data_type=self.indices_updater_decode.data_type,
+                    q_data_type=self.indices_updater_decode.q_data_type,
+                    non_blocking=True,
+                )
         elif forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
@@ -749,6 +856,9 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        # Decode-style verify redirect: when DecodeMetadata is set for TARGET_VERIFY
+        if isinstance(self.forward_metadata, DecodeMetadata):
+            return self.forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]

@@ -1359,6 +1359,24 @@ class HybridLinearAttnBackend(AttentionBackend):
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
+        elif (
+            forward_batch.forward_mode.is_target_verify()
+            and hasattr(self.full_attn_backend, "forward_verify")
+        ):
+            # Speculative verify with sparse decode-style verify (MiniCPMSparseBackend).
+            # SA layers use forward_verify; LA layers go through normal extend path
+            # (SimpleGLA's forward() handles TARGET_VERIFY via model's direct call).
+            layer_id = layer.layer_id if layer else kwargs.get("layer_id")
+            if layer_id in self.full_attn_layers:
+                return self.full_attn_backend.forward_verify(
+                    q, k, v, layer, forward_batch,
+                    save_kv_cache=save_kv_cache, **kwargs,
+                )
+            # LA layers: fall through to forward_extend (handles TARGET_VERIFY)
+            return self.forward_extend(
+                q, k, v, layer, forward_batch,
+                save_kv_cache=save_kv_cache, **kwargs,
+            )
         else:
             return self.forward_extend(
                 q,
@@ -1392,10 +1410,8 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
-        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
         # Compute common indices once to avoid duplication
         valid_mask = accepted_steps >= 0
@@ -1410,10 +1426,14 @@ class HybridLinearAttnBackend(AttentionBackend):
             :, src_state_indices, last_steps
         ].to(ssm_states.dtype, copy=False)
 
-        # Scatter into conv_states at the chosen cache lines
-        conv_states[:, dst_state_indices, :] = intermediate_conv_window_cache[
-            :, src_state_indices, last_steps
-        ].to(conv_states.dtype, copy=False)
+        # Scatter into conv_states at the chosen cache lines (if conv states exist)
+        has_conv = len(mamba_caches.conv) > 0 and mamba_caches.conv[0].numel() > 0
+        if has_conv:
+            conv_states = mamba_caches.conv[0]
+            intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
+            conv_states[:, dst_state_indices, :] = intermediate_conv_window_cache[
+                :, src_state_indices, last_steps
+            ].to(conv_states.dtype, copy=False)
 
         # Track indices used for tracking mamba states for prefix cache
         if mamba_track_indices is not None:
@@ -1431,10 +1451,11 @@ class HybridLinearAttnBackend(AttentionBackend):
                 :, src_track_indices, track_steps
             ].to(ssm_states.dtype, copy=False)
 
-            # scatter into conv_states at the chosen track states
-            conv_states[:, dst_track_indices, :] = intermediate_conv_window_cache[
-                :, src_track_indices, track_steps
-            ].to(conv_states.dtype, copy=False)
+            # scatter into conv_states at the chosen track states (if conv states exist)
+            if has_conv:
+                conv_states[:, dst_track_indices, :] = intermediate_conv_window_cache[
+                    :, src_track_indices, track_steps
+                ].to(conv_states.dtype, copy=False)
 
 
 class SimpleGLAAttnBackend(MambaAttnBackendBase):
@@ -1564,13 +1585,21 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         head_dim = q.shape[3]
         if forward_batch.forward_mode.is_decode():
             seq_len = 1
+        elif forward_batch.forward_mode.is_target_verify():
+            # Speculative verify: draft_token_num tokens per request
+            seq_len = forward_batch.spec_info.draft_token_num
         else:
             seq_len = torch.max(forward_batch.extend_seq_lens)
 
         mamba_indices = self._get_mamba_indices(forward_batch)
         initial_state = None
         has_initial_state = forward_batch.extend_prefix_lens is not None and forward_batch.extend_prefix_lens > 0
-        if forward_batch.forward_mode.is_decode() or has_initial_state.any():
+        need_initial_state = forward_batch.forward_mode.is_decode() or forward_batch.forward_mode.is_target_verify()
+        if not need_initial_state and hasattr(has_initial_state, 'any'):
+            need_initial_state = has_initial_state.any()
+        elif not need_initial_state and isinstance(has_initial_state, bool):
+            need_initial_state = has_initial_state
+        if need_initial_state:
             cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
             if cache_idx is not None:
                 layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
@@ -1587,7 +1616,57 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         g_gamma = self.g_gamma
 
         mode = "fused_recurrent" if seq_len < 64 else "chunk"
-        if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
+
+        if forward_batch.forward_mode.is_target_verify():
+            # Speculative verify for SimpleGLA: process each token as a decode step
+            # to ensure numerical consistency with baseline decode mode.
+            # fused_recurrent_simple_gla may produce different outputs for
+            # cu_seqlens=[0,12] vs cu_seqlens=[0,1] due to kernel internals.
+            cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
+            if cache_idx is None:
+                raise RuntimeError(
+                    f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map."
+                )
+            layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
+            spec_cache = self.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+            cache_layer_idx = list(self.req_to_token_pool.mamba_map.values()).index(cache_idx)
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            n_req = q.shape[1] // draft_token_num
+
+            # Process each verify token as a single decode step (cu_seqlens=[0,1,...,n_req])
+            cu_decode = torch.arange(0, n_req + 1, dtype=torch.int32, device=q.device)
+            outputs = []
+            state = initial_state
+            for t in range(draft_token_num):
+                idx = torch.arange(t, q.shape[1], draft_token_num, device=q.device)
+                o_t, state = fused_recurrent_simple_gla(
+                    q=q[:, idx], k=k[:, idx], v=v[:, idx],
+                    g_gamma=g_gamma, scale=scale,
+                    initial_state=state,
+                    output_final_state=True,
+                    cu_seqlens=cu_decode,
+                )
+                outputs.append(o_t)
+
+                # Save intermediate state for rollback
+                # state shape: (n_req, heads, dim, dim) from fused_recurrent with cu_seqlens
+                # Do NOT squeeze — squeeze(0) corrupts shape when n_req=1.
+                inter_indices = torch.arange(n_req, device=q.device)
+                spec_cache.intermediate_ssm[
+                    cache_layer_idx, inter_indices, t
+                ] = state[:n_req].to(spec_cache.intermediate_ssm.dtype)
+
+            # Reconstruct output in request-major order: [r0_t0, r0_t1, ..., r0_t11, r1_t0, ...]
+            o = torch.cat(
+                [outputs[t][:, r:r+1] for r in range(n_req) for t in range(draft_token_num)],
+                dim=1,
+            )
+            final_state = state
+
+            # Write final state (update_mamba_state_after_mtp_verify will correct it)
+            layer_cache.temporal[mamba_indices[:n_req], :] = final_state
+
+        elif forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
             o, final_state = fused_recurrent_simple_gla(
                 q=q,
                 k=k,
@@ -1598,6 +1677,17 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 output_final_state=True,
                 cu_seqlens=self.forward_metadata.query_start_loc,
             )
+
+            if final_state is not None:
+                mamba_indices = self._get_mamba_indices(forward_batch)
+                cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
+                if cache_idx is not None:
+                    layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
+                    layer_cache.temporal[mamba_indices, :] = final_state
+                else:
+                    raise RuntimeError(
+                        f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map."
+                    )
         else:
             o, final_state = chunk_simple_gla(
                 q=q,
@@ -1610,19 +1700,16 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 cu_seqlens=self.forward_metadata.query_start_loc,
             )
 
-        if final_state is not None:
-            mamba_indices = self._get_mamba_indices(forward_batch)
-            cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
-
-            if cache_idx is not None:
-                layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
-                layer_cache.temporal[mamba_indices, :] = final_state
-            else:
-                raise RuntimeError(
-                    f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map. "
-                    f"Cannot save state - layer must be registered in cache_params.layers. "
-                    f"Available layers: {list(self.req_to_token_pool.mamba_map.keys())}"
-                )
+            if final_state is not None:
+                mamba_indices = self._get_mamba_indices(forward_batch)
+                cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
+                if cache_idx is not None:
+                    layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
+                    layer_cache.temporal[mamba_indices, :] = final_state
+                else:
+                    raise RuntimeError(
+                        f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map."
+                    )
 
         o = o.reshape(-1, num_heads * head_dim)
 

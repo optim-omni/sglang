@@ -14,7 +14,7 @@
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
 
 import math
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -536,20 +536,29 @@ class MiniCPMModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # For EAGLE3 / DFlash support
+        self.layers_to_capture = []
+
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids) * self.config.scale_emb
         else:
             hidden_states = input_embeds
         residual = None
 
+        aux_hidden_states = []
+
         for i in range(len(self.layers)):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -557,8 +566,14 @@ class MiniCPMModel(nn.Module):
                 forward_batch,
                 residual,
             )
+
+
         hidden_states = self.norm(hidden_states)
-        return hidden_states
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
 
 class MiniCPMSALAForCausalLM(nn.Module):
@@ -589,6 +604,17 @@ class MiniCPMSALAForCausalLM(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
 
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        """Set which layers' hidden states to capture for EAGLE3/DFlash."""
+        if layer_ids is None:
+            n = self.config.num_hidden_layers
+            self.model.layers_to_capture = [n // 3, 2 * n // 3, n - 1]
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
     @torch.no_grad()
     def forward(
         self,
@@ -600,6 +626,20 @@ class MiniCPMSALAForCausalLM(nn.Module):
         if input_embeds is not None:
             input_embeds = input_embeds * self.config.scale_emb
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+
+        # Handle aux_hidden_states from EAGLE3 capture
+        if isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
+            hidden_states = hidden_states / self.scale_width
+            if self.config.tie_word_embeddings:
+                lm_head = self.model.embed_tokens
+            else:
+                lm_head = self.lm_head
+            return self.logits_processor(
+                input_ids, hidden_states, lm_head, forward_batch,
+                aux_hidden_states=aux_hidden_states,
+            )
+
         hidden_states = hidden_states / self.scale_width
         if self.config.tie_word_embeddings:
             lm_head = self.model.embed_tokens

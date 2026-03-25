@@ -317,7 +317,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine_weight_info = None
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.eagle_use_aux_hidden_state = False
-        if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
+        if (self.spec_algorithm.is_eagle3() or self.spec_algorithm.is_dflash()) and not self.is_draft_worker:
             # load draft config
             draft_model_config = ModelConfig.from_server_args(
                 server_args,
@@ -565,10 +565,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_cublas()
             self.init_attention_backend()
             self.kernel_warmup()
-            self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
-            self.init_device_graphs()
         else:
             self.graph_runner = None
             self.graph_mem_usage = 0
@@ -577,10 +575,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
 
+        # Set aux hidden capture layers BEFORE graph capture so output buffers
+        # are sized for concatenated aux_hidden_states (e.g. 5 * 4096 = 20480).
+        # NOTE: layers_to_capture is always active (prefill+decode+verify),
+        # which means aux_hidden_states path is taken for all forwards.
         if self.eagle_use_aux_hidden_state:
             self.model.set_eagle3_layers_to_capture(
                 self.eagle_aux_hidden_state_layer_ids
             )
+            logger.info(f"EAGLE3 layers_to_capture set: {self.model.model.layers_to_capture}")
+
+        # Now capture device graphs (after layers_to_capture is configured)
+        if self.device in ["cuda", "npu", "cpu"]:
+            self.init_device_graphs()
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
@@ -1746,7 +1753,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             set_torch_compile_config()
 
         if self.eagle_use_aux_hidden_state:
-            self.model.set_eagle3_layers_to_capture()
+            self.model.set_eagle3_layers_to_capture(
+                self.eagle_aux_hidden_state_layer_ids
+            )
 
         require_mlp_tp_gather_ = require_mlp_tp_gather(self.server_args)
         if require_gathered_buffer(self.server_args):

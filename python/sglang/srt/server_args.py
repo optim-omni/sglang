@@ -440,6 +440,8 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    speculative_dflash_block_size: Optional[int] = None
+    speculative_dflash_draft_window_size: Optional[int] = None
     enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
@@ -2056,6 +2058,33 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
+        if self.speculative_algorithm == "DFLASH":
+            if self.enable_dp_attention:
+                raise ValueError("DFLASH does not support dp attention.")
+            if self.pp_size > 1:
+                raise ValueError("DFLASH does not support pipeline parallelism.")
+            if self.speculative_draft_model_path is None:
+                raise ValueError("DFLASH requires --speculative-draft-model-path.")
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for DFLASH. "
+                    "You can override this by explicitly setting --max-running-requests."
+                )
+            self.speculative_num_steps = 1
+            self.speculative_eagle_topk = 1
+            if self.speculative_num_draft_tokens is None:
+                try:
+                    from transformers import AutoConfig
+                    draft_cfg = AutoConfig.from_pretrained(
+                        self.speculative_draft_model_path, trust_remote_code=True
+                    )
+                    self.speculative_num_draft_tokens = getattr(draft_cfg, 'block_size', 12)
+                except Exception:
+                    self.speculative_num_draft_tokens = 12
+            self.disable_overlap_schedule = True
+            self.enable_mixed_chunk = False
+
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
@@ -3446,7 +3475,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -3586,6 +3615,20 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
+        )
+
+        # DFlash speculative decoding
+        parser.add_argument(
+            "--speculative-dflash-block-size",
+            type=int,
+            default=ServerArgs.speculative_dflash_block_size,
+            help="DFlash verify window length (block size).",
+        )
+        parser.add_argument(
+            "--speculative-dflash-draft-window-size",
+            type=int,
+            default=ServerArgs.speculative_dflash_draft_window_size,
+            help="DFlash draft KV cache sliding window size.",
         )
 
         # Multi-layer Eagle speculative decoding

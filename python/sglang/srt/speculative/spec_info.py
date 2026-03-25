@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 class SpeculativeAlgorithm(Enum):
     """Enumeration of speculative decoding algorithms."""
 
+    DFLASH = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     STANDALONE = auto()
@@ -41,6 +42,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
+
+    def is_dflash(self) -> bool:
+        return self == SpeculativeAlgorithm.DFLASH
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
@@ -74,6 +78,15 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
             return StandaloneWorker
+        elif self.is_dflash():
+            if enable_overlap:
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap worker creation."
+                )
+
+            from sglang.srt.speculative.dflash_worker import DFlashWorker
+
+            return DFlashWorker
         elif self.is_ngram():
             if enable_overlap:
                 raise ValueError(
@@ -90,6 +103,8 @@ class SpeculativeAlgorithm(Enum):
 class SpecInputType(IntEnum):
     # NOTE: introduce this to distinguish the SpecInput types of multiple algorithms when asserting in attention backends.
     # If all algorithms can share the same datastrucutre of draft_input and verify_input, consider simplify it
+    DFLASH_DRAFT = auto()
+    DFLASH_VERIFY = auto()
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
     NGRAM_VERIFY = auto()
@@ -102,12 +117,16 @@ class SpecInput(ABC):
     def is_draft_input(self) -> bool:
         # FIXME: remove this function which is only used for assertion
         # or use another variable name like `draft_input` to substitute `spec_info`
-        return self.spec_input_type == SpecInputType.EAGLE_DRAFT
+        return self.spec_input_type in {
+            SpecInputType.EAGLE_DRAFT,
+            SpecInputType.DFLASH_DRAFT,
+        }
 
     def is_verify_input(self) -> bool:
         return self.spec_input_type in {
             SpecInputType.EAGLE_VERIFY,
             SpecInputType.NGRAM_VERIFY,
+            SpecInputType.DFLASH_VERIFY,
         }
 
     @abstractmethod
