@@ -217,6 +217,9 @@ class NGRAMWorker:
         accept_lens = None
 
         if model_worker_batch.forward_mode.is_target_verify():
+            # Save LA state before verify (for accept_length=0 restore).
+            # NGram verify has no "current_token" at position 0, so accept_length=0
+            # means we need to roll back to the state BEFORE any draft token.
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
             )
@@ -232,6 +235,54 @@ class NGRAMWorker:
             accept_lens = verify_input.accept_length
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
+
+            # Rollback LA (SimpleGLA/Mamba) state to the accepted position.
+            # NGram verify tokens are [draft_0, ..., draft_{D-1}] (no current_token at pos 0).
+            # intermediate_ssm[t] = state after processing draft_0..draft_t.
+            # For accept_length=N>0: want state after draft_0..draft_{N-1} = intermediate[N-1].
+            # For accept_length=0: want initial_state (before any draft) = pre_verify_state.
+            attn_backend = self.target_worker.model_runner.attn_backend
+            if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+                bs = batch.batch_size()
+
+                # Rollback for accept_length > 0: use intermediate_ssm[accept_length - 1]
+                # Rollback to intermediate[accept_length]:
+                # - accept_length>0: state after accepted tokens + bonus position ✅
+                # - accept_length=0: intermediate[0] = state after draft_0 (compromise:
+                #   draft_0 may be wrong, but includes 1 token state update. pre_verify
+                #   has 0 updates, which is further from correct autoregressive state.
+                #   DFlash avoids this by including current_token as token 0.)
+                accepted_steps = verify_input.accept_length.to(torch.int64)
+                mamba_steps_to_track = None
+                if batch.mamba_track_indices is not None:
+                    mamba_track_interval = self.server_args.mamba_track_interval
+                    seq_lens_pre = batch.seq_lens - (verify_input.accept_length + 1)
+                    to_track_mask = (
+                        seq_lens_pre // mamba_track_interval
+                        != batch.seq_lens // mamba_track_interval
+                    )
+                    tracking_point = (
+                        batch.seq_lens // mamba_track_interval
+                    ) * mamba_track_interval
+                    to_track_ith = torch.clamp(
+                        tracking_point - seq_lens_pre - 1, min=0
+                    )
+                    can_track_mask = to_track_mask & (
+                        to_track_ith < (verify_input.accept_length + 1).to(to_track_ith.dtype)
+                    )
+                    mamba_steps_to_track = torch.where(
+                        can_track_mask,
+                        to_track_ith.to(torch.int64),
+                        torch.full_like(to_track_ith, -1, dtype=torch.int64),
+                    )
+                attn_backend.update_mamba_state_after_mtp_verify(
+                    accepted_steps=accepted_steps,
+                    mamba_track_indices=batch.mamba_track_indices,
+                    mamba_steps_to_track=mamba_steps_to_track,
+                    model=self.target_worker.model_runner.model,
+                )
+
+
             self._update_ngram_cache(batch)
             batch.forward_mode = ForwardMode.DECODE
 

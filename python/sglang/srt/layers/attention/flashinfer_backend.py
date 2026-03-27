@@ -474,30 +474,62 @@ class FlashInferAttnBackend(AttentionBackend):
             draft_token_num = spec_info.draft_token_num
             bs = len(forward_batch.req_pool_indices)
             flat_bs = bs * draft_token_num
-
-            offsets = torch.arange(
-                1, draft_token_num + 1,
-                device=forward_batch.seq_lens.device,
-                dtype=forward_batch.seq_lens.dtype,
-            )
-            flat_seq_lens = (
-                forward_batch.seq_lens.unsqueeze(1) + offsets.unsqueeze(0)
-            ).reshape(-1)
-            flat_req_pool_indices = forward_batch.req_pool_indices.repeat_interleave(
-                draft_token_num
-            )
-
-            from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-            kv_indptr = torch.zeros(flat_bs + 1, dtype=torch.int32, device="cuda")
-            kv_indptr[1:] = torch.cumsum(flat_seq_lens.int(), dim=0)
-            kv_indices = torch.empty(
-                int(flat_seq_lens.sum().item()), dtype=torch.int32, device="cuda"
-            )
             req_to_token = forward_batch.req_to_token_pool.req_to_token
-            create_flashinfer_kv_indices_triton[(flat_bs,)](
-                req_to_token, flat_req_pool_indices, flat_seq_lens.int(),
-                kv_indptr, None, kv_indices, req_to_token.shape[1],
-            )
+            device = forward_batch.seq_lens.device
+
+            custom_mask = getattr(spec_info, 'custom_mask', None)
+            has_tree = custom_mask is not None and getattr(spec_info, 'topk', 1) > 1
+
+            if has_tree:
+                # Tree-aware decode-style verify: each draft token only sees
+                # its ancestors in the tree, not siblings from other branches.
+                # Extract per-token visible KV set from custom_mask.
+                all_kv_indices = []
+                kv_lens = []
+                for req_idx in range(bs):
+                    prefix_len = int(forward_batch.seq_lens[req_idx].item())
+                    kv_len = prefix_len + draft_token_num
+                    # custom_mask for this request: (draft_token_num × kv_len) flattened
+                    mask_offset = req_idx * draft_token_num * kv_len
+                    req_mask = custom_mask[mask_offset : mask_offset + draft_token_num * kv_len]
+                    req_mask_2d = req_mask.view(draft_token_num, kv_len)
+
+                    # Get KV cache indices for this request (prefix + draft)
+                    req_pool_idx = forward_batch.req_pool_indices[req_idx]
+                    full_kv = req_to_token[req_pool_idx, :kv_len].to(torch.int32)
+
+                    for q in range(draft_token_num):
+                        visible = req_mask_2d[q].bool()
+                        visible_indices = full_kv[visible]
+                        all_kv_indices.append(visible_indices)
+                        kv_lens.append(len(visible_indices))
+
+                kv_lens_tensor = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+                kv_indptr = torch.zeros(flat_bs + 1, dtype=torch.int32, device=device)
+                kv_indptr[1:] = torch.cumsum(kv_lens_tensor, dim=0)
+                kv_indices = torch.cat(all_kv_indices).to(device)
+            else:
+                # Chain (topk=1): simple linear causal — each token sees all previous
+                offsets = torch.arange(
+                    1, draft_token_num + 1, device=device,
+                    dtype=forward_batch.seq_lens.dtype,
+                )
+                flat_seq_lens = (
+                    forward_batch.seq_lens.unsqueeze(1) + offsets.unsqueeze(0)
+                ).reshape(-1)
+                flat_req_pool_indices = forward_batch.req_pool_indices.repeat_interleave(
+                    draft_token_num
+                )
+                from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+                kv_indptr = torch.zeros(flat_bs + 1, dtype=torch.int32, device=device)
+                kv_indptr[1:] = torch.cumsum(flat_seq_lens.int(), dim=0)
+                kv_indices = torch.empty(
+                    int(flat_seq_lens.sum().item()), dtype=torch.int32, device=device
+                )
+                create_flashinfer_kv_indices_triton[(flat_bs,)](
+                    req_to_token, flat_req_pool_indices, flat_seq_lens.int(),
+                    kv_indptr, None, kv_indices, req_to_token.shape[1],
+                )
 
             verify_decode_wrappers = []
             for i in range(self.num_wrappers):
@@ -507,7 +539,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 wrapper.begin_forward(
                     kv_indptr, kv_indices,
-                    torch.ones(flat_bs, dtype=torch.int32, device="cuda"),
+                    torch.ones(flat_bs, dtype=torch.int32, device=device),
                     self.indices_updater_decode.num_qo_heads,
                     self.indices_updater_decode.num_kv_heads,
                     self.indices_updater_decode.head_dim, 1,
@@ -847,6 +879,90 @@ class FlashInferAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def _serial_decode_verify(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        """Serial decode verify: loop D times with batch=N per iteration.
+
+        Each iteration uses the exact same FlashInfer decode kernel path as
+        autoregressive decode (batch=N, split-k enabled). This guarantees
+        bit-identical SA attention output regardless of D.
+
+        FlashInfer's split-k strategy varies with batch size, causing ~1e-5
+        numerical differences between batch=1 and batch=D. MiniCPM-SALA's
+        24 LA recurrent layers (g≈1) amplify this to complete output divergence.
+        """
+        spec_info = forward_batch.spec_info
+        draft_token_num = spec_info.draft_token_num
+        bs = forward_batch.batch_size
+        device = q.device
+
+        # Write all draft tokens' KV to cache first
+        cache_loc = forward_batch.out_cache_loc
+        if k is not None and save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+            )
+
+        # Q shape: (bs*D, num_heads*head_dim) → split into D groups of bs
+        q_all = q.view(bs, draft_token_num, -1)  # (bs, D, num_heads*head_dim)
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
+
+        outputs = []
+        from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+
+        for j in range(draft_token_num):
+            # Each token j has effective seq_len = orig_seq_lens + j + 1
+            eff_seq_lens = (forward_batch.seq_lens + j + 1).int()
+
+            # Build kv_indices for batch=bs (same as normal decode)
+            kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+            kv_indptr[1:] = torch.cumsum(eff_seq_lens, dim=0)
+            kv_indices = torch.empty(
+                int(eff_seq_lens.sum().item()), dtype=torch.int32, device=device
+            )
+            create_flashinfer_kv_indices_triton[(bs,)](
+                req_to_token, forward_batch.req_pool_indices, eff_seq_lens,
+                kv_indptr, None, kv_indices, req_to_token.shape[1],
+            )
+
+            # Create decode wrapper with batch=bs (identical to normal decode)
+            wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer, "NHD",
+                use_tensor_cores=self.decode_use_tensor_cores,
+            )
+            wrapper.begin_forward(
+                kv_indptr, kv_indices,
+                torch.ones(bs, dtype=torch.int32, device=device),
+                self.indices_updater_decode.num_qo_heads,
+                self.indices_updater_decode.num_kv_heads,
+                self.indices_updater_decode.head_dim, 1,
+                data_type=self.indices_updater_decode.data_type,
+                q_data_type=self.indices_updater_decode.q_data_type,
+                non_blocking=True,
+            )
+
+            # Extract Q for token j and run decode
+            q_j = q_all[:, j, :].contiguous()  # (bs, num_heads*head_dim)
+            q_j = q_j.view(bs, layer.tp_q_head_num, layer.head_dim)
+            o_j = wrapper.forward(
+                q_j,
+                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+            )
+            outputs.append(o_j)
+
+        # Reassemble: (bs, D, num_heads*head_dim) → (bs*D, num_heads*head_dim)
+        output = torch.stack(outputs, dim=1)  # (bs, D, num_heads, head_dim)
+        return output.reshape(bs * draft_token_num, -1)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -856,9 +972,21 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        # Decode-style verify redirect: when DecodeMetadata is set for TARGET_VERIFY
+        # Decode-style verify redirect
         if isinstance(self.forward_metadata, DecodeMetadata):
-            return self.forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
+            # Use serial decode: D × batch=1 calls for bit-identical SA attention
+            result = self._serial_decode_verify(q, k, v, layer, forward_batch, save_kv_cache)
+            # One-shot debug: print token 0 output at first SA layer
+            if not hasattr(self, '_sdv_dbg'):
+                self._sdv_dbg = True
+                import logging
+                logging.getLogger().info(
+                    f"SERIAL_DBG layer={layer.layer_id} "
+                    f"result[0]_norm={result[0].norm().item():.6f} "
+                    f"q[0]_norm={q[0].norm().item():.6f} "
+                    f"D={forward_batch.spec_info.draft_token_num}"
+                )
+            return result
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]

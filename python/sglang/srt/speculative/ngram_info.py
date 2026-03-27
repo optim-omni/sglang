@@ -437,6 +437,59 @@ class NgramVerifyInput(SpecInput):
 
         self._free_cache(batch, page_size, accept_length_cpu)
 
+        # Allocate sparse k1/k2 tokens for newly committed positions so that
+        # cache_finished_req can free them correctly (MiniCPM-SALA KV pool leak fix).
+        commit_lens_cpu = [int(accept_length_cpu[i].item()) + 1 for i in range(bs)]
+        _rtp = batch.req_to_token_pool
+        if hasattr(_rtp, "kernel_size") and hasattr(_rtp, "kernel_stride"):
+            from sglang.srt.mem_cache.common import alloc_token_slots
+            _ks1 = _rtp.kernel_size
+            _kst1 = _rtp.kernel_stride
+            _ks2 = _ks1 * 4
+            _kst2 = _kst1 * 4
+            total_new_k1 = 0
+            total_new_k2 = 0
+            new_k1_per_req = []
+            new_k2_per_req = []
+            for i in range(bs):
+                s = int(batch.seq_lens[i].item())
+                c = commit_lens_cpu[i]
+                s_new = s + c
+                k1_before = (s - _ks1) // _kst1 + 1 if s >= _ks1 else 0
+                k1_after = (s_new - _ks1) // _kst1 + 1 if s_new >= _ks1 else 0
+                nk1 = k1_after - k1_before
+                k2_before = (s - _ks2) // _kst2 + 1 if s >= _ks2 else 0
+                k2_after = (s_new - _ks2) // _kst2 + 1 if s_new >= _ks2 else 0
+                nk2 = k2_after - k2_before
+                new_k1_per_req.append(nk1)
+                new_k2_per_req.append(nk2)
+                total_new_k1 += nk1
+                total_new_k2 += nk2
+            if total_new_k1 > 0:
+                k1_loc = alloc_token_slots(batch.tree_cache, total_new_k1)
+                pt = 0
+                for i in range(bs):
+                    nk1 = new_k1_per_req[i]
+                    if nk1 > 0:
+                        s = int(batch.seq_lens[i].item())
+                        k1_before = (s - _ks1) // _kst1 + 1 if s >= _ks1 else 0
+                        _rtp.req_to_sparse_k1_token[
+                            batch.req_pool_indices[i], k1_before : k1_before + nk1,
+                        ] = k1_loc[pt : pt + nk1].to(torch.int32)
+                        pt += nk1
+            if total_new_k2 > 0:
+                k2_loc = alloc_token_slots(batch.tree_cache, total_new_k2)
+                pt = 0
+                for i in range(bs):
+                    nk2 = new_k2_per_req[i]
+                    if nk2 > 0:
+                        s = int(batch.seq_lens[i].item())
+                        k2_before = (s - _ks2) // _kst2 + 1 if s >= _ks2 else 0
+                        _rtp.req_to_sparse_k2_token[
+                            batch.req_pool_indices[i], k2_before : k2_before + nk2,
+                        ] = k2_loc[pt : pt + nk2].to(torch.int32)
+                        pt += nk2
+
         batch.seq_lens.add_(self.accept_length + 1)
         batch.seq_lens_cpu.add_(accept_length_cpu + 1)
 
