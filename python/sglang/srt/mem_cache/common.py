@@ -139,10 +139,13 @@ def write_cache_indices(
         req_idx = req_pool_indices_cpu[i].item()
         prefix_len = prefix_lens_cpu[i].item()
         k1_len = (prefix_len - kernel_size) // kernel_stride + 1 if kernel_size is not None and kernel_stride > 0 and prefix_len >= kernel_size else 0
+        # Use actual tensor length to avoid mismatch when prefix_k1 not populated
+        actual_k1_len = len(prefix_k1_tensors[i]) if prefix_k1_tensors[i] is not None else 0
+        k1_len = min(k1_len, actual_k1_len)
         if k1_len > 0:
             req_to_token_pool.write_sparse_k1(
                     (req_idx, slice(0, k1_len)),
-                    prefix_k1_tensors[i],
+                    prefix_k1_tensors[i][:k1_len],
             )
         if sparse_k1_loc is not None:
             req_to_token_pool.write_sparse_k1(
@@ -157,10 +160,12 @@ def write_cache_indices(
         req_idx = req_pool_indices_cpu[i].item()
         prefix_len = prefix_lens_cpu[i].item()
         k2_len = (prefix_len - k2_kernel_size) // k2_kernel_stride + 1 if k2_kernel_size is not None and k2_kernel_stride > 0 and prefix_len >= k2_kernel_size else 0
+        actual_k2_len = len(prefix_k2_tensors[i]) if prefix_k2_tensors[i] is not None else 0
+        k2_len = min(k2_len, actual_k2_len)
         if k2_len > 0:
             req_to_token_pool.write_sparse_k2(
                     (req_idx, slice(0, k2_len)),
-                    prefix_k2_tensors[i],
+                    prefix_k2_tensors[i][:k2_len],
             )
         if sparse_k2_loc is not None:
             req_to_token_pool.write_sparse_k2(
@@ -423,6 +428,11 @@ def alloc_for_extend(
             sparse_k2_loc = alloc_token_slots(batch.tree_cache, batch.token_sum_sparse_k2)
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
+        # Paged allocation - also allocate sparse K1/K2
+        if batch.token_sum_sparse_k1 > 0:
+            sparse_k1_loc = alloc_token_slots(batch.tree_cache, batch.token_sum_sparse_k1)
+        if batch.token_sum_sparse_k2 > 0:
+            sparse_k2_loc = alloc_token_slots(batch.tree_cache, batch.token_sum_sparse_k2)
         # Paged allocation - build last_loc
         last_loc = [
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
