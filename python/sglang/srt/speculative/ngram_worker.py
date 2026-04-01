@@ -57,6 +57,27 @@ class NGRAMWorker:
             draft_token_num=server_args.speculative_num_draft_tokens,
         )
 
+        # Load pre-built ngram cache for warm-start
+        if server_args.speculative_ngram_cache_path:
+            import os
+            cache_path = server_args.speculative_ngram_cache_path
+            if os.path.exists(cache_path):
+                self.ngram_cache.load(cache_path)
+                logger.info(f"Loaded ngram cache from {cache_path}")
+            else:
+                logger.warning(f"Ngram cache path {cache_path} not found, starting cold")
+
+        # Auto-save ngram cache on exit (for building cache from model outputs)
+        if getattr(server_args, 'speculative_ngram_cache_save_path', None):
+            import atexit
+            save_path = server_args.speculative_ngram_cache_save_path
+            def _save_cache():
+                try:
+                    self.ngram_cache.save(save_path)
+                except Exception as e:
+                    logger.error(f"Failed to save ngram cache: {e}")
+            atexit.register(_save_cache)
+
     def clear_cache_pool(self):
         self.ngram_cache.reset()
 

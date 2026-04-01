@@ -54,6 +54,17 @@ class NgramCache:
     def reset(self):
         self.cache.reset()
 
+    def save(self, path: str):
+        """Save ngram trie to binary file for later warm-start."""
+        self.cache.synchronize()
+        self.cache.save(path)
+        logger.info(f"NgramCache saved to {path}")
+
+    def load(self, path: str):
+        """Load ngram trie from binary file to skip cold start."""
+        self.cache.load(path)
+        logger.info(f"NgramCache loaded from {path}")
+
     def batch_get(self, batch_tokens: List[List[int]]) -> Tuple[np.ndarray, np.ndarray]:
         result = self.cache.batchMatch(batch_tokens)
         return np.array(result.token), np.array(result.mask)

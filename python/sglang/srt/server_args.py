@@ -440,6 +440,8 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    speculative_ngram_cache_path: Optional[str] = None
+    speculative_ngram_cache_save_path: Optional[str] = None
     speculative_dflash_block_size: Optional[int] = None
     speculative_dflash_draft_window_size: Optional[int] = None
     enable_multi_layer_eagle: bool = False
@@ -591,6 +593,7 @@ class ServerArgs:
     enable_nsa_prefill_context_parallel: bool = False
     nsa_prefill_cp_mode: str = "in-seq-split"
     enable_fused_qk_norm_rope: bool = False
+    enable_minicpm_kernel_fusion: bool = False
     enable_precise_embedding_interpolation: bool = False
 
     # Dynamic batch tokenizer
@@ -3617,6 +3620,19 @@ class ServerArgs:
             help="The cache capacity for ngram speculative decoding.",
         )
 
+        parser.add_argument(
+            "--speculative-ngram-cache-path",
+            type=str,
+            default=ServerArgs.speculative_ngram_cache_path,
+            help="Path to a pre-built ngram cache file for warm-start (skip cold start).",
+        )
+        parser.add_argument(
+            "--speculative-ngram-cache-save-path",
+            type=str,
+            default=ServerArgs.speculative_ngram_cache_save_path,
+            help="Save ngram cache to this path on server exit (for building cache from model outputs).",
+        )
+
         # DFlash speculative decoding
         parser.add_argument(
             "--speculative-dflash-block-size",
@@ -4356,6 +4372,11 @@ class ServerArgs:
             "--enable-fused-qk-norm-rope",
             action="store_true",
             help="Enable fused qk normalization and rope rotary embedding.",
+        )
+        parser.add_argument(
+            "--enable-minicpm-kernel-fusion",
+            action="store_true",
+            help="Enable MiniCPM-SALA kernel fusion: RoPE FP16 + Fused Residual Scale + Fused Sigmoid Gate.",
         )
         parser.add_argument(
             "--enable-precise-embedding-interpolation",

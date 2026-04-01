@@ -101,6 +101,12 @@ class Ngram {
     return param_;
   }
 
+  // Save trie to binary file. Format: sequence of (path_len, token0, token1, ..., freq) int32 tuples.
+  void save(const std::string& path) const;
+
+  // Load trie from binary file. Inserts all paths synchronously (blocking).
+  void load(const std::string& path);
+
  private:
   Result matchBFS(const std::vector<int32_t>& tokens, size_t batch_size) const;
   Result matchProb(const std::vector<int32_t>& tokens, size_t batch_size) const;

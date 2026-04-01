@@ -7,6 +7,7 @@
 #include <list>
 #include <mutex>
 #include <queue>
+#include <fstream>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
@@ -376,6 +377,119 @@ void Ngram::Result::truncate(size_t n) {
     token.resize(n);
     mask.resize(n * n);
   }
+}
+
+// ── Save/Load ──────────────────────────────────────────────────────────────
+
+void Ngram::save(const std::string& path) const {
+  synchronize();  // wait for pending inserts
+  std::unique_lock<std::mutex> lock(mutex_);
+
+  std::ofstream ofs(path, std::ios::binary);
+  if (!ofs) {
+    throw std::runtime_error("Ngram::save: cannot open " + path);
+  }
+
+  // DFS: collect all (path, freq) pairs for leaf and internal nodes
+  struct Frame {
+    const TrieNode* node;
+    std::vector<int32_t> prefix;
+  };
+  std::queue<Frame> q;
+  for (auto* child : root_->sorted_children) {
+    q.push({child, {child->token}});
+  }
+
+  uint64_t entry_count = 0;
+  // Reserve space for entry count at beginning
+  ofs.write(reinterpret_cast<const char*>(&entry_count), sizeof(entry_count));
+
+  while (!q.empty()) {
+    auto [node, prefix] = std::move(q.front());
+    q.pop();
+
+    // Write this node if it has frequency (all nodes should, but guard)
+    if (node->freq > 0) {
+      int32_t path_len = static_cast<int32_t>(prefix.size());
+      ofs.write(reinterpret_cast<const char*>(&path_len), sizeof(path_len));
+      ofs.write(reinterpret_cast<const char*>(prefix.data()), path_len * sizeof(int32_t));
+      ofs.write(reinterpret_cast<const char*>(&node->freq), sizeof(int32_t));
+      entry_count++;
+    }
+
+    // Enqueue children
+    for (auto* child : node->sorted_children) {
+      auto child_prefix = prefix;
+      child_prefix.push_back(child->token);
+      q.push({child, std::move(child_prefix)});
+    }
+  }
+
+  // Write actual entry count at beginning
+  ofs.seekp(0);
+  ofs.write(reinterpret_cast<const char*>(&entry_count), sizeof(entry_count));
+  ofs.close();
+}
+
+void Ngram::load(const std::string& path) {
+  std::ifstream ifs(path, std::ios::binary);
+  if (!ifs) {
+    throw std::runtime_error("Ngram::load: cannot open " + path);
+  }
+
+  uint64_t entry_count = 0;
+  ifs.read(reinterpret_cast<char*>(&entry_count), sizeof(entry_count));
+
+  std::unique_lock<std::mutex> lock(mutex_);
+
+  for (uint64_t i = 0; i < entry_count; ++i) {
+    int32_t path_len = 0;
+    ifs.read(reinterpret_cast<char*>(&path_len), sizeof(path_len));
+    if (path_len <= 0 || path_len > 10000) {
+      throw std::runtime_error("Ngram::load: invalid path_len " + std::to_string(path_len));
+    }
+
+    std::vector<int32_t> tokens(path_len);
+    ifs.read(reinterpret_cast<char*>(tokens.data()), path_len * sizeof(int32_t));
+
+    int32_t freq = 0;
+    ifs.read(reinterpret_cast<char*>(&freq), sizeof(freq));
+
+    // Insert path into trie, setting freq
+    if (static_cast<size_t>(path_len) > free_node_count_) {
+      squeeze(path_len - free_node_count_);
+    }
+
+    TrieNode* cursor = root_;
+    for (int32_t j = 0; j < path_len; ++j) {
+      int32_t token = tokens[j];
+      auto iter = cursor->child.find(token);
+      if (iter == cursor->child.end()) {
+        iter = cursor->child.insert({token, getNode()}).first;
+        auto node = iter->second;
+        cursor->lru.emplace_front(node);
+        global_lru_.emplace_back(node);
+        node->token = token;
+        node->parent = cursor;
+        node->parent_lru_pos = cursor->lru.begin();
+        node->global_lru_pos = --global_lru_.end();
+        node->freq = (j == path_len - 1) ? freq : 1;
+        cursor->sorted_children.insert(node);
+      } else {
+        auto node = iter->second;
+        if (j == path_len - 1) {
+          // Update freq for the target node
+          cursor->sorted_children.erase(node);
+          node->freq = std::max(node->freq, freq);
+          cursor->sorted_children.insert(node);
+        }
+        cursor->lru.splice(cursor->lru.begin(), cursor->lru, node->parent_lru_pos);
+      }
+      cursor = iter->second;
+      global_lru_.splice(global_lru_.begin(), global_lru_, cursor->global_lru_pos);
+    }
+  }
+  ifs.close();
 }
 
 }  // namespace ngram

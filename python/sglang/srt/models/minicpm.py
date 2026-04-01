@@ -20,6 +20,32 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.server_args import get_global_server_args
+
+# MiniCPM kernel fusion flags (lazy init on first use)
+_MINICPM_FUSION_INITIALIZED = False
+_MINICPM_FUSION_ENABLED = False
+_FUSED_ADD_SCALE = None
+_FUSED_SIGMOID_MUL = None
+
+
+def _init_minicpm_fusion():
+    global _MINICPM_FUSION_INITIALIZED, _MINICPM_FUSION_ENABLED
+    global _FUSED_ADD_SCALE, _FUSED_SIGMOID_MUL
+    if _MINICPM_FUSION_INITIALIZED:
+        return
+    _MINICPM_FUSION_INITIALIZED = True
+    try:
+        server_args = get_global_server_args()
+        if getattr(server_args, 'enable_minicpm_kernel_fusion', False):
+            from sglang.srt.layers.custom_kernels.fused_add_scale import fused_add_scale
+            from sglang.srt.layers.custom_kernels.fused_sigmoid_mul import fused_sigmoid_mul
+            _FUSED_ADD_SCALE = fused_add_scale
+            _FUSED_SIGMOID_MUL = fused_sigmoid_mul
+            _MINICPM_FUSION_ENABLED = True
+    except (ValueError, ImportError):
+        pass
+
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import SimpleGLAAttnBackend
@@ -183,16 +209,24 @@ class MiniCPMAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         if self.attn_use_rope:
-            orig_dtype = q.dtype
-            q, k = q.float(), k.float()
-            q, k = self.rotary_emb(positions, q, k)
-            q, k = q.to(orig_dtype), k.to(orig_dtype)
+            if _MINICPM_FUSION_ENABLED:
+                # F1: RoPE directly in fp16, skip float cast
+                q, k = self.rotary_emb(positions, q, k)
+            else:
+                orig_dtype = q.dtype
+                q, k = q.float(), k.float()
+                q, k = self.rotary_emb(positions, q, k)
+                q, k = q.to(orig_dtype), k.to(orig_dtype)
 
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.use_output_gate:
             o_gate_output, _ = self.o_gate(hidden_states)
-            attn_output = attn_output * F.sigmoid(o_gate_output)
+            if _MINICPM_FUSION_ENABLED and _FUSED_SIGMOID_MUL is not None:
+                # F3: Fused sigmoid + mul
+                attn_output = _FUSED_SIGMOID_MUL(attn_output, o_gate_output)
+            else:
+                attn_output = attn_output * F.sigmoid(o_gate_output)
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -308,6 +342,18 @@ class MiniCPMLightningMixer(nn.Module):
         self.layer_id = layer_id
         self.state_shape = (self.num_kv_heads, self.head_dim, self.head_dim)
 
+        # Fused QK Norm + RoPE for LA layers (requires sgl_kernel.fused_qk_norm_rope)
+        self._use_fused_qk_norm_rope = False
+        if self.qk_norm and self.use_rope and self.head_dim in (64, 128, 256):
+            try:
+                server_args = get_global_server_args()
+                if getattr(server_args, 'enable_fused_qk_norm_rope', False):
+                    from sgl_kernel import fused_qk_norm_rope
+                    self._fused_qk_norm_rope = fused_qk_norm_rope
+                    self._use_fused_qk_norm_rope = True
+            except (ValueError, ImportError):
+                pass
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -315,19 +361,53 @@ class MiniCPMLightningMixer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        if self.qk_norm:
-            q = self.q_norm(q.reshape(-1, self.head_dim))
-            k = self.k_norm(k.reshape(-1, self.head_dim))
+        if self._use_fused_qk_norm_rope:
+            # Fused QK Norm + RoPE: single kernel, no extra reshape/cast
+            pos_ids = positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
+            need_cast = qkv.dtype != torch.bfloat16
+            if need_cast:
+                orig_dtype = qkv.dtype
+                qkv = qkv.to(torch.bfloat16)
+            self._fused_qk_norm_rope(
+                qkv,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+                self.q_norm.weight.to(torch.bfloat16),
+                self.k_norm.weight.to(torch.bfloat16),
+                self.rope_theta,
+                True,  # is_neox_style
+                pos_ids,
+                1.0,   # factor (no yarn scaling)
+                0.0,   # low
+                0.0,   # high
+                1.0,   # attention_factor
+            )
+            if need_cast:
+                qkv = qkv.to(orig_dtype)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            # Original non-fused path
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        if self.use_rope:
-            q = q.reshape(-1, self.num_heads * self.head_dim)
-            k = k.reshape(-1, self.num_kv_heads * self.head_dim)
-            orig_dtype = q.dtype
-            q, k = q.float(), k.float()
-            q, k = self.rotary_emb(positions, q, k)
-            q, k = q.to(orig_dtype), k.to(orig_dtype)
+            if self.qk_norm:
+                q = self.q_norm(q.reshape(-1, self.head_dim))
+                k = self.k_norm(k.reshape(-1, self.head_dim))
+
+            if self.use_rope:
+                q = q.reshape(-1, self.num_heads * self.head_dim)
+                k = k.reshape(-1, self.num_kv_heads * self.head_dim)
+                if _MINICPM_FUSION_ENABLED:
+                    # F1: RoPE directly in fp16, skip float cast
+                    q, k = self.rotary_emb(positions, q, k)
+                else:
+                    orig_dtype = q.dtype
+                    q, k = q.float(), k.float()
+                    q, k = self.rotary_emb(positions, q, k)
+                    q, k = q.to(orig_dtype), k.to(orig_dtype)
 
         q = q.reshape(-1, self.num_heads, self.head_dim)
         k = k.reshape(-1, self.num_kv_heads, self.head_dim)
@@ -372,7 +452,11 @@ class MiniCPMLightningMixer(nn.Module):
 
         if self.use_output_gate:
             z, _ = self.z_proj(hidden_states)
-            o = o * F.sigmoid(z)
+            if _MINICPM_FUSION_ENABLED and _FUSED_SIGMOID_MUL is not None:
+                # F3: Fused sigmoid + mul
+                o = _FUSED_SIGMOID_MUL(o, z)
+            else:
+                o = o * F.sigmoid(z)
 
         y, _ = self.o_proj(o)
         return y
@@ -491,17 +575,21 @@ class MiniCPMDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states = residual + hidden_states * (
-            self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
-        )
+        _scale = self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
+        if _MINICPM_FUSION_ENABLED and _FUSED_ADD_SCALE is not None:
+            # F2: Fused residual + hidden * scale
+            hidden_states = _FUSED_ADD_SCALE(residual, hidden_states, _scale)
+        else:
+            hidden_states = residual + hidden_states * _scale
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states * (
-            self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
-        )
+        if _MINICPM_FUSION_ENABLED and _FUSED_ADD_SCALE is not None:
+            hidden_states = _FUSED_ADD_SCALE(residual, hidden_states, _scale)
+        else:
+            hidden_states = residual + hidden_states * _scale
 
         return hidden_states, None
 
@@ -514,6 +602,7 @@ class MiniCPMModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        _init_minicpm_fusion()  # Initialize kernel fusion flags
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size

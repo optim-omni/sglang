@@ -972,21 +972,9 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        # Decode-style verify redirect
+        # Decode-style verify redirect: when DecodeMetadata is set for TARGET_VERIFY
         if isinstance(self.forward_metadata, DecodeMetadata):
-            # Use serial decode: D × batch=1 calls for bit-identical SA attention
-            result = self._serial_decode_verify(q, k, v, layer, forward_batch, save_kv_cache)
-            # One-shot debug: print token 0 output at first SA layer
-            if not hasattr(self, '_sdv_dbg'):
-                self._sdv_dbg = True
-                import logging
-                logging.getLogger().info(
-                    f"SERIAL_DBG layer={layer.layer_id} "
-                    f"result[0]_norm={result[0].norm().item():.6f} "
-                    f"q[0]_norm={q[0].norm().item():.6f} "
-                    f"D={forward_batch.spec_info.draft_token_num}"
-                )
-            return result
+            return self.forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]

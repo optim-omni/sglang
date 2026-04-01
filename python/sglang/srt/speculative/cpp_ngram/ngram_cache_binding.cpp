@@ -13,7 +13,9 @@ PYBIND11_MODULE(ngram_cache_cpp, m) {
       .def("asyncInsert", &Ngram::asyncInsert, "")
       .def("batchMatch", &Ngram::batchMatch, "")
       .def("reset", &Ngram::reset, "")
-      .def("synchronize", &Ngram::synchronize, "");
+      .def("synchronize", &Ngram::synchronize, "")
+      .def("save", &Ngram::save, "", py::arg("path"))
+      .def("load", &Ngram::load, "", py::arg("path"));
 
   py::class_<Param>(m, "Param")
       .def(py::init<>())
