@@ -25,23 +25,16 @@ from sglang.srt.server_args import get_global_server_args
 # MiniCPM kernel fusion flags (lazy init on first use)
 _MINICPM_FUSION_INITIALIZED = False
 _MINICPM_FUSION_ENABLED = False
-_FUSED_ADD_SCALE = None
-_FUSED_SIGMOID_MUL = None
 
 
 def _init_minicpm_fusion():
     global _MINICPM_FUSION_INITIALIZED, _MINICPM_FUSION_ENABLED
-    global _FUSED_ADD_SCALE, _FUSED_SIGMOID_MUL
     if _MINICPM_FUSION_INITIALIZED:
         return
     _MINICPM_FUSION_INITIALIZED = True
     try:
         server_args = get_global_server_args()
         if getattr(server_args, 'enable_minicpm_kernel_fusion', False):
-            from sglang.srt.layers.custom_kernels.fused_add_scale import fused_add_scale
-            from sglang.srt.layers.custom_kernels.fused_sigmoid_mul import fused_sigmoid_mul
-            _FUSED_ADD_SCALE = fused_add_scale
-            _FUSED_SIGMOID_MUL = fused_sigmoid_mul
             _MINICPM_FUSION_ENABLED = True
     except (ValueError, ImportError):
         pass
@@ -222,11 +215,7 @@ class MiniCPMAttention(nn.Module):
 
         if self.use_output_gate:
             o_gate_output, _ = self.o_gate(hidden_states)
-            if _MINICPM_FUSION_ENABLED and _FUSED_SIGMOID_MUL is not None:
-                # F3: Fused sigmoid + mul
-                attn_output = _FUSED_SIGMOID_MUL(attn_output, o_gate_output)
-            else:
-                attn_output = attn_output * F.sigmoid(o_gate_output)
+            attn_output = attn_output * F.sigmoid(o_gate_output)
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -452,11 +441,7 @@ class MiniCPMLightningMixer(nn.Module):
 
         if self.use_output_gate:
             z, _ = self.z_proj(hidden_states)
-            if _MINICPM_FUSION_ENABLED and _FUSED_SIGMOID_MUL is not None:
-                # F3: Fused sigmoid + mul
-                o = _FUSED_SIGMOID_MUL(o, z)
-            else:
-                o = o * F.sigmoid(z)
+            o = o * F.sigmoid(z)
 
         y, _ = self.o_proj(o)
         return y
@@ -576,20 +561,13 @@ class MiniCPMDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
         _scale = self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
-        if _MINICPM_FUSION_ENABLED and _FUSED_ADD_SCALE is not None:
-            # F2: Fused residual + hidden * scale
-            hidden_states = _FUSED_ADD_SCALE(residual, hidden_states, _scale)
-        else:
-            hidden_states = residual + hidden_states * _scale
+        hidden_states = residual + hidden_states * _scale
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        if _MINICPM_FUSION_ENABLED and _FUSED_ADD_SCALE is not None:
-            hidden_states = _FUSED_ADD_SCALE(residual, hidden_states, _scale)
-        else:
-            hidden_states = residual + hidden_states * _scale
+        hidden_states = residual + hidden_states * _scale
 
         return hidden_states, None
 
