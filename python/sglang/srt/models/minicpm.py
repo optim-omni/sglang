@@ -21,24 +21,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.server_args import get_global_server_args
-
-# MiniCPM kernel fusion flags (lazy init on first use)
-_MINICPM_FUSION_INITIALIZED = False
-_MINICPM_FUSION_ENABLED = False
-
-
-def _init_minicpm_fusion():
-    global _MINICPM_FUSION_INITIALIZED, _MINICPM_FUSION_ENABLED
-    if _MINICPM_FUSION_INITIALIZED:
-        return
-    _MINICPM_FUSION_INITIALIZED = True
-    try:
-        server_args = get_global_server_args()
-        if getattr(server_args, 'enable_minicpm_kernel_fusion', False):
-            _MINICPM_FUSION_ENABLED = True
-    except (ValueError, ImportError):
-        pass
-
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import SimpleGLAAttnBackend
@@ -202,14 +184,10 @@ class MiniCPMAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         if self.attn_use_rope:
-            if _MINICPM_FUSION_ENABLED:
-                # F1: RoPE directly in fp16, skip float cast
-                q, k = self.rotary_emb(positions, q, k)
-            else:
-                orig_dtype = q.dtype
-                q, k = q.float(), k.float()
-                q, k = self.rotary_emb(positions, q, k)
-                q, k = q.to(orig_dtype), k.to(orig_dtype)
+            orig_dtype = q.dtype
+            q, k = q.float(), k.float()
+            q, k = self.rotary_emb(positions, q, k)
+            q, k = q.to(orig_dtype), k.to(orig_dtype)
 
         attn_output = self.attn(q, k, v, forward_batch)
 
@@ -352,12 +330,7 @@ class MiniCPMLightningMixer(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
 
         if self._use_fused_qk_norm_rope:
-            # Fused QK Norm + RoPE: single kernel, no extra reshape/cast
-            pos_ids = positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
-            need_cast = qkv.dtype != torch.bfloat16
-            if need_cast:
-                orig_dtype = qkv.dtype
-                qkv = qkv.to(torch.bfloat16)
+            # Fused QK Norm + RoPE: single kernel (bf16 native, no cast needed)
             self._fused_qk_norm_rope(
                 qkv,
                 self.num_heads,
@@ -365,18 +338,16 @@ class MiniCPMLightningMixer(nn.Module):
                 self.num_kv_heads,
                 self.head_dim,
                 self.q_norm.variance_epsilon,
-                self.q_norm.weight.to(torch.bfloat16),
-                self.k_norm.weight.to(torch.bfloat16),
+                self.q_norm.weight,
+                self.k_norm.weight,
                 self.rope_theta,
                 True,  # is_neox_style
-                pos_ids,
+                positions.to(torch.int32),
                 1.0,   # factor (no yarn scaling)
                 0.0,   # low
                 0.0,   # high
                 1.0,   # attention_factor
             )
-            if need_cast:
-                qkv = qkv.to(orig_dtype)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         else:
             # Original non-fused path
@@ -389,14 +360,10 @@ class MiniCPMLightningMixer(nn.Module):
             if self.use_rope:
                 q = q.reshape(-1, self.num_heads * self.head_dim)
                 k = k.reshape(-1, self.num_kv_heads * self.head_dim)
-                if _MINICPM_FUSION_ENABLED:
-                    # F1: RoPE directly in fp16, skip float cast
-                    q, k = self.rotary_emb(positions, q, k)
-                else:
-                    orig_dtype = q.dtype
-                    q, k = q.float(), k.float()
-                    q, k = self.rotary_emb(positions, q, k)
-                    q, k = q.to(orig_dtype), k.to(orig_dtype)
+                orig_dtype = q.dtype
+                q, k = q.float(), k.float()
+                q, k = self.rotary_emb(positions, q, k)
+                q, k = q.to(orig_dtype), k.to(orig_dtype)
 
         q = q.reshape(-1, self.num_heads, self.head_dim)
         k = k.reshape(-1, self.num_kv_heads, self.head_dim)
@@ -550,26 +517,27 @@ class MiniCPMDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Build sparse metadata (model-specific logic!)
+        _scale = self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
 
         # Self Attention
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states *= _scale
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        _scale = self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
-        hidden_states = residual + hidden_states * _scale
 
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states *= _scale
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states * _scale
 
-        return hidden_states, None
+        return hidden_states, residual
 
 
 class MiniCPMModel(nn.Module):
@@ -580,7 +548,6 @@ class MiniCPMModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        _init_minicpm_fusion()  # Initialize kernel fusion flags
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -635,7 +602,9 @@ class MiniCPMModel(nn.Module):
             )
 
 
-        hidden_states = self.norm(hidden_states)
+        _scale = self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
+        hidden_states *= _scale
+        hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) == 0:
             return hidden_states

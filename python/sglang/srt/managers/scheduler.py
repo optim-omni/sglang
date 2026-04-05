@@ -2963,6 +2963,19 @@ def run_scheduler_process(
 
         pipe_writer.send(result_dict)
 
+        # SIGUSR1: save ngram cache on demand
+        _ngram_save_path = getattr(server_args, 'speculative_ngram_cache_save_path', None)
+        if _ngram_save_path:
+            def _sigusr1_handler(signum, frame):
+                try:
+                    if hasattr(scheduler, 'draft_worker') and scheduler.draft_worker is not None:
+                        scheduler.draft_worker.ngram_cache.save(_ngram_save_path)
+                        logger.info(f"Ngram cache saved to {_ngram_save_path}")
+                except Exception as e:
+                    logger.error(f"Failed to save ngram cache: {e}")
+            signal.signal(signal.SIGUSR1, _sigusr1_handler)
+            logger.info(f"SIGUSR1 handler registered for ngram cache save -> {_ngram_save_path}")
+
         # Dispatch to the appropriate event loop based on the disaggregation mode
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
