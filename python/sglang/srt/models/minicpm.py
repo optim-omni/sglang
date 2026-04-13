@@ -484,6 +484,16 @@ class MiniCPMDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+
+        # fused_add_rmsnorm: controlled by --enable-fused-qk-norm-rope
+        self._use_fused_residual_norm = False
+        try:
+            server_args = get_global_server_args()
+            if getattr(server_args, 'enable_fused_qk_norm_rope', False):
+                self._use_fused_residual_norm = True
+        except (ValueError, ImportError):
+            pass
+
     def _compute_topk(self, forward_batch, base_metadata, sparse_metadata):
         """Compute TopK indices for sparse attention.
 
@@ -513,25 +523,38 @@ class MiniCPMDecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         _scale = self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
 
-        # Self Attention
-        if residual is None:
+        if self._use_fused_residual_norm:
+            # Fused path: residual add + RMSNorm in single HBM pass
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states *= _scale
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            hidden_states *= _scale
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            hidden_states = self.mlp(hidden_states)
+            return hidden_states, residual
+        else:
+            # Original path: separate residual add + RMSNorm
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states *= _scale
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
-
-        # Fully Connected
-        hidden_states *= _scale
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-
-        return hidden_states, residual
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            hidden_states = residual + hidden_states * _scale
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states * _scale
+            return hidden_states, None
 
 
 class MiniCPMModel(nn.Module):
@@ -596,9 +619,14 @@ class MiniCPMModel(nn.Module):
             )
 
 
-        _scale = self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
-        hidden_states *= _scale
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if residual is not None:
+            # Fused path: last layer residual
+            _scale = self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
+            hidden_states *= _scale
+            hidden_states, _ = self.norm(hidden_states, residual)
+        else:
+            # Original path: hidden_states already contains residual
+            hidden_states = self.norm(hidden_states)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
