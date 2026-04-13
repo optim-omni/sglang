@@ -632,11 +632,10 @@ class MiniCPMSALAForCausalLM(nn.Module):
                 lm_head = self.model.embed_tokens
             else:
                 lm_head = self.lm_head
-            logits_output = self.logits_processor(
-                input_ids, hidden_states, lm_head, forward_batch
+            return self.logits_processor(
+                input_ids, hidden_states, lm_head, forward_batch,
+                aux_hidden_states=aux_hidden_states,
             )
-            logits_output.aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
-            return logits_output
 
         hidden_states = hidden_states / self.scale_width
         if self.config.tie_word_embeddings:
