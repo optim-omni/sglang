@@ -1600,16 +1600,16 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         elif not need_initial_state and isinstance(has_initial_state, bool):
             need_initial_state = has_initial_state
         if need_initial_state:
-            cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
-            if cache_idx is not None:
-                layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
-                initial_state = layer_cache.temporal[mamba_indices, :].contiguous()
-            else:
-                raise RuntimeError(
-                    f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map. "
-                    f"This indicates a misconfiguration - lightning layers must be registered in cache_params.layers. "
-                    f"Available layers: {list(self.req_to_token_pool.mamba_map.keys())}"
-                )
+                cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
+                if cache_idx is not None:
+                    layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
+                    initial_state = layer_cache.temporal[mamba_indices, :].contiguous()
+                else:
+                    raise RuntimeError(
+                        f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map. "
+                        f"This indicates a misconfiguration - lightning layers must be registered in cache_params.layers. "
+                        f"Available layers: {list(self.req_to_token_pool.mamba_map.keys())}"
+                    )
 
         scale = self.scale
 
@@ -1618,10 +1618,6 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         mode = "fused_recurrent" if seq_len < 64 else "chunk"
 
         if forward_batch.forward_mode.is_target_verify():
-            # Speculative verify for SimpleGLA: process each token as a decode step
-            # to ensure numerical consistency with baseline decode mode.
-            # fused_recurrent_simple_gla may produce different outputs for
-            # cu_seqlens=[0,12] vs cu_seqlens=[0,1] due to kernel internals.
             cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
             if cache_idx is None:
                 raise RuntimeError(
@@ -1633,11 +1629,10 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
             draft_token_num = forward_batch.spec_info.draft_token_num
             n_req = q.shape[1] // draft_token_num
 
-            # Process each verify token as a single decode step (cu_seqlens=[0,1,...,n_req])
+            # LA verify: Python T=1 loop D times with intermediate state saves
             cu_decode = torch.arange(0, n_req + 1, dtype=torch.int32, device=q.device)
             outputs = []
             state = initial_state
-            _la_dbg_key = f"_la_dbg_{layer_id}"
             for t in range(draft_token_num):
                 idx = torch.arange(t, q.shape[1], draft_token_num, device=q.device)
                 o_t, state = fused_recurrent_simple_gla(
@@ -1648,39 +1643,40 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                     cu_seqlens=cu_decode,
                 )
                 outputs.append(o_t)
-                # One-shot per-layer debug
-                if not hasattr(self, _la_dbg_key) and t == 0:
-                    setattr(self, _la_dbg_key, True)
-                    import logging
-                    logging.getLogger().info(
-                        f"LA_DBG layer={layer_id} t=0 "
-                        f"q_norm={q[:, idx].norm().item():.6f} "
-                        f"k_norm={k[:, idx].norm().item():.6f} "
-                        f"o_norm={o_t.norm().item():.6f} "
-                        f"state_norm={state.norm().item():.6f} "
-                        f"init_state_norm={initial_state.norm().item():.6f} "
-                        f"D={draft_token_num}"
-                    )
 
-                # Save intermediate state for rollback
-                # state shape: (n_req, heads, dim, dim) from fused_recurrent with cu_seqlens
-                # Do NOT squeeze — squeeze(0) corrupts shape when n_req=1.
                 inter_indices = torch.arange(n_req, device=q.device)
                 spec_cache.intermediate_ssm[
                     cache_layer_idx, inter_indices, t
                 ] = state[:n_req].to(spec_cache.intermediate_ssm.dtype)
 
-            # Reconstruct output in request-major order: [r0_t0, r0_t1, ..., r0_t11, r1_t0, ...]
             o = torch.cat(
                 [outputs[t][:, r:r+1] for r in range(n_req) for t in range(draft_token_num)],
                 dim=1,
             )
             final_state = state
-
-            # Write final state (update_mamba_state_after_mtp_verify will correct it)
             layer_cache.temporal[mamba_indices[:n_req], :] = final_state
 
-        elif forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
+        elif forward_batch.forward_mode.is_decode():
+            o, final_state = fused_recurrent_simple_gla(
+                q=q,
+                k=k,
+                v=v,
+                g_gamma=g_gamma,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=self.forward_metadata.query_start_loc,
+            )
+            if final_state is not None:
+                cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
+                if cache_idx is not None:
+                    layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
+                    layer_cache.temporal[mamba_indices, :] = final_state
+                else:
+                    raise RuntimeError(
+                        f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map."
+                    )
+        elif mode == "fused_recurrent":
             o, final_state = fused_recurrent_simple_gla(
                 q=q,
                 k=k,

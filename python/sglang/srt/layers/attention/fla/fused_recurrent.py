@@ -719,3 +719,170 @@ def fused_recurrent_gated_delta_rule_update(
         retrieve_parent_token,
     )
     return o
+
+
+
+# ---------------------------------------------------------------------------
+# SimpleGLA fused kernel for verify — forked from FLA fused_recurrent_fwd_kernel.
+# Adds: h0_indices pool access, CACHE_INTERMEDIATE_STATES, DISABLE_STATE_UPDATE.
+# Uses FLA's exact pointer math and loop structure (proven correct via unit test).
+# ---------------------------------------------------------------------------
+
+@triton.heuristics({
+    'USE_INITIAL_STATE': lambda args: args['h0_source'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'CACHE_INTERMEDIATE_STATES': lambda args: args['intermediate_states_buffer'] is not None,
+})
+@triton.jit(do_not_specialize=['B', 'T'])
+def fused_recurrent_simple_gla_fla_kernel(
+    q, k, v, g_gamma,
+    o,
+    h0_source,           # state pool (or gathered tensor)
+    h0_indices,          # (N,) int32 — index into h0_source per request
+    ht,                  # final state output (same layout as h0_source entries)
+    cu_seqlens,
+    scale,
+    intermediate_states_buffer,   # (pool_size, D, H, K, V) or None
+    intermediate_state_indices,   # (N,) int32
+    cache_steps,                  # D
+    B, T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    STORE_FINAL_STATE: tl.constexpr,
+    DISABLE_STATE_UPDATE: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    CACHE_INTERMEDIATE_STATES: tl.constexpr,
+):
+    # Exactly FLA's program_id mapping
+    i_v, i_k, i_nh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
+    i_n, i_h = i_nh // H, i_nh % H
+
+    all = B * T
+    if IS_VARLEN:
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T = eos - bos
+    else:
+        bos, eos = i_n * T, i_n * T + T
+
+    # Exactly FLA's pointer setup
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    p_q = q + bos * H*K + i_h * K + o_k
+    p_k = k + bos * H*K + i_h * K + o_k
+    p_v = v + bos * H*V + i_h * V + o_v
+    p_o = o + (i_k * all + bos) * H*V + i_h * V + o_v
+
+    b_g_gamma = tl.load(g_gamma + i_h)
+
+    m_k = o_k < K
+    m_v = o_v < V
+    m_h = m_k[:, None] & m_v[None, :]
+    b_h = tl.zeros([BK, BV], dtype=tl.float32)
+
+    # Load initial state via h0_indices (pool indexing)
+    if USE_INITIAL_STATE:
+        idx = tl.load(h0_indices + i_n)
+        if idx >= 0:
+            p_h0 = h0_source + idx * H * K * V + (i_h * K * V) + o_k[:, None] * V + o_v[None, :]
+            b_h += tl.load(p_h0, mask=m_h, other=0).to(tl.float32)
+
+    # Intermediate state cache setup
+    cache_idx = -1
+    if CACHE_INTERMEDIATE_STATES:
+        cache_idx = tl.load(intermediate_state_indices + i_n)
+
+    step_idx = 0
+    for _ in range(0, T):
+        # Exactly FLA's inner loop
+        b_q = tl.load(p_q, mask=m_k, other=0).to(tl.float32) * scale
+        b_k = tl.load(p_k, mask=m_k, other=0).to(tl.float32)
+        b_v = tl.load(p_v, mask=m_v, other=0).to(tl.float32)
+        b_h = b_h * exp(b_g_gamma)
+        b_h += b_k[:, None] * b_v[None, :]
+        b_o = b_h * b_q[:, None]
+        b_o = tl.sum(b_o, axis=0)
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_v)
+
+        # Cache intermediate state per step
+        if CACHE_INTERMEDIATE_STATES:
+            if cache_idx >= 0:
+                step_offset = step_idx * H * K * V
+                cache_ptr = (
+                    intermediate_states_buffer
+                    + cache_idx * cache_steps * H * K * V
+                    + step_offset
+                    + (i_h * K * V)
+                    + o_k[:, None] * V
+                    + o_v[None, :]
+                )
+                tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=m_h)
+
+        step_idx += 1
+        # Exactly FLA's pointer increments
+        p_q += H*K
+        p_k += H*K
+        p_v += H*V
+        p_o += H*V
+
+    # Write final state back to pool
+    if not DISABLE_STATE_UPDATE:
+        if USE_INITIAL_STATE:
+            idx = tl.load(h0_indices + i_n)
+            if idx >= 0:
+                p_ht = h0_source + idx * H * K * V + i_h * K * V + o_k[:, None] * V + o_v[None, :]
+                tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=m_h)
+
+    if STORE_FINAL_STATE:
+        p_ht = ht + i_nh * K*V + o_k[:, None] * V + o_v[None, :]
+        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=m_h)
+
+
+def fused_recurrent_simple_gla_update_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_gamma: torch.Tensor,
+    scale: float,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    cu_seqlens: Optional[torch.LongTensor] = None,
+    disable_state_update: bool = False,
+    output_final_state: bool = False,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    intermediate_state_indices: Optional[torch.Tensor] = None,
+    cache_steps: Optional[int] = None,
+) -> torch.Tensor:
+    """SimpleGLA verify kernel — FLA-based with pool access + intermediate caching."""
+    B, T, H, K, V = *k.shape, v.shape[-1]
+    N = B if cu_seqlens is None else len(cu_seqlens) - 1
+
+    # Match FLA exactly: BK=64, BV=64, fp32 output
+    BK, BV = min(triton.next_power_of_2(K), 64), min(triton.next_power_of_2(V), 64)
+    NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
+
+    ht = q.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
+    o = q.new_empty(NK, *v.shape, dtype=torch.float32)
+
+    grid = (NV, NK, N * H)  # FLA's grid order: (NV, NK, N*H)
+    fused_recurrent_simple_gla_fla_kernel[grid](
+        q=q, k=k, v=v, g_gamma=g_gamma,
+        o=o,
+        h0_source=initial_state_source,
+        h0_indices=initial_state_indices,
+        ht=ht,
+        cu_seqlens=cu_seqlens,
+        scale=scale,
+        intermediate_states_buffer=intermediate_states_buffer,
+        intermediate_state_indices=intermediate_state_indices,
+        cache_steps=0 if cache_steps is None else cache_steps,
+        T=T, B=B, H=H, K=K, V=V,
+        BK=BK, BV=BV,
+        STORE_FINAL_STATE=output_final_state,
+        DISABLE_STATE_UPDATE=disable_state_update,
+    )
+    o = o.sum(0)
+    return o

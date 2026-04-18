@@ -372,7 +372,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         metadata.k1 = compression_metadata["k1"]
         metadata.k2 = compression_metadata["k2"]
 
-        if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed() or forward_batch.forward_mode.is_target_verify():
             metadata.sparse_bs_list = (
                 self.sparse_batch_analyzer.identify_sparse_batches(forward_batch, self.dense_as_sparse)
             )
@@ -440,7 +440,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             for i in range(forward_batch.batch_size):
                 if forward_batch.seq_lens_cpu[i] >= self.dense_len:
                     seqlens_q_sparse_list.append(forward_batch.extend_seq_lens_cpu[i])
-            
+
             seqlen_q_sparse_tensor = torch.tensor(seqlens_q_sparse_list, dtype=torch.int32, device=metadata.cu_seqlens_q.device)
             cu_seqlen_q_sparse_tensor = F.pad(torch.cumsum(seqlen_q_sparse_tensor, dim=0, dtype=torch.int32), (1, 0))
             # metadata.cu_seqlens_q = torch.cat(cu_seqlens_q_list, dim=0)
@@ -469,16 +469,54 @@ class MiniCPMSparseBackend(AttentionBackend):
             metadata.cu_seqlens_q_adjusted = metadata.cu_seqlens_q * self.heads_per_group
             metadata.max_seqlen_q_adjusted = metadata.max_seq_len_q * self.heads_per_group
 
+    def _prepare_target_verify_as_extend(self, forward_batch: ForwardBatch):
+        """Synthesize extend-style metadata for TARGET_VERIFY.
+
+        Treats D draft tokens per request as a D-length extend (causal mask).
+        Populates extend_{prefix,seq}_lens and extends seq_lens by D so that
+        downstream sparse K1/K2 metadata builders see the full KV length.
+        """
+        draft_token_num = forward_batch.spec_info.draft_token_num
+        bs = forward_batch.batch_size
+        device = forward_batch.seq_lens.device
+
+        # Save original prefix lens, then extend seq_lens to include the D draft tokens
+        forward_batch.extend_prefix_lens = forward_batch.seq_lens.clone().to(torch.int32)
+        if torch.is_tensor(forward_batch.seq_lens_cpu):
+            forward_batch.extend_prefix_lens_cpu = forward_batch.seq_lens_cpu.tolist()
+        else:
+            forward_batch.extend_prefix_lens_cpu = list(forward_batch.seq_lens_cpu)
+
+        forward_batch.extend_seq_lens = torch.full(
+            (bs,), draft_token_num, dtype=torch.int32, device=device,
+        )
+        forward_batch.extend_seq_lens_cpu = [draft_token_num] * bs
+
+        # seq_lens now reflects post-verify total (prefix + D) — aligns with
+        # existing draft K/V already in pool at out_cache_loc
+        forward_batch.seq_lens = forward_batch.seq_lens + draft_token_num
+        if torch.is_tensor(forward_batch.seq_lens_cpu):
+            forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + draft_token_num
+        else:
+            forward_batch.seq_lens_cpu = torch.tensor(
+                [s + draft_token_num for s in forward_batch.seq_lens_cpu],
+                dtype=torch.int32,
+            )
+        if forward_batch.seq_lens_sum is not None:
+            forward_batch.seq_lens_sum = forward_batch.seq_lens_sum + int(bs) * int(draft_token_num)
+        forward_batch.extend_num_tokens = int(bs) * int(draft_token_num)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
-        if forward_batch.forward_mode.is_target_verify():
-            raise NotImplementedError(
-                "MiniCPM backend does not support speculative decoding (target verify)"
-            )
         if forward_batch.forward_mode.is_draft_extend(include_v2=True):
             raise NotImplementedError(
-                "MiniCPM backend does not support speculative decoding (draft extend)"
+                "MiniCPM backend does not support draft extend"
             )
+
+        # TARGET_VERIFY: synthesize extend-like metadata so downstream code can
+        # treat D draft tokens per request as a D-length extend (causal).
+        if forward_batch.forward_mode.is_target_verify():
+            self._prepare_target_verify_as_extend(forward_batch)
 
         metadata = MiniCPMBackendMetadata()
         seqlens_in_batch = forward_batch.seq_lens
@@ -500,7 +538,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             ]
         elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
             include_draft_extend_v2=True
-        ):
+        ) or forward_batch.forward_mode.is_target_verify():
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(

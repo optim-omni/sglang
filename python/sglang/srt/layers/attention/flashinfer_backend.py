@@ -449,7 +449,7 @@ class FlashInferAttnBackend(AttentionBackend):
         elif forward_batch.forward_mode.is_target_verify():
             # Check if we should use prefill verify (original) or decode verify
             import os
-            use_prefill_verify = os.environ.get("SGLANG_PREFILL_VERIFY", "0") == "1"
+            use_prefill_verify = os.environ.get("SGLANG_PREFILL_VERIFY", "1") == "1"
             if use_prefill_verify:
                 self.indices_updater_prefill.update(
                     forward_batch.req_pool_indices,
