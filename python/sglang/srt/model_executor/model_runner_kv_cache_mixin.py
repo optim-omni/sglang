@@ -137,7 +137,57 @@ class ModelRunnerKVCacheMixin:
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
-        return int(rest_memory * (1 << 30)) // cell_size
+        divisor = cell_size + self._dflash_draft_cell_size_per_token()
+        return int(rest_memory * (1 << 30)) // divisor
+
+    def _dflash_draft_cell_size_per_token(self: ModelRunner) -> int:
+        """DFlash draft shares target's token_to_kv_pool_allocator, so its KV
+        buffer must accommodate target's full slot-ID range. On the target
+        worker, add the draft's per-token KV cost into the divisor so a single
+        --mem-fraction-static budget covers both pools. Returns 0 otherwise."""
+        if self.is_draft_worker:
+            return 0
+        sa = self.server_args
+        if getattr(sa, "speculative_algorithm", None) != "DFLASH":
+            return 0
+        draft_path = getattr(sa, "speculative_draft_model_path", None)
+        if not draft_path:
+            return 0
+        try:
+            from transformers import AutoConfig
+            draft_cfg = AutoConfig.from_pretrained(
+                draft_path,
+                trust_remote_code=True,
+                revision=getattr(sa, "speculative_draft_model_revision", None) or "main",
+            )
+        except Exception as e:
+            logger.warning(
+                "DFLASH draft config read failed (%s); skipping draft KV reservation.",
+                e,
+            )
+            return 0
+        n_layers = int(getattr(draft_cfg, "num_hidden_layers", 0) or 0)
+        n_kv = getattr(draft_cfg, "num_key_value_heads", None)
+        if n_kv is None:
+            n_kv = getattr(draft_cfg, "num_attention_heads", 0)
+        n_kv = int(n_kv or 0)
+        head_dim = getattr(draft_cfg, "head_dim", None)
+        if head_dim is None:
+            hidden = int(getattr(draft_cfg, "hidden_size", 0) or 0)
+            heads = int(getattr(draft_cfg, "num_attention_heads", 1) or 1)
+            head_dim = hidden // heads if heads else 0
+        head_dim = int(head_dim or 0)
+        tp = max(get_attention_tp_size(), 1)
+        kv_heads_local = max(n_kv // tp, 1) if n_kv >= tp else n_kv
+        kv_bytes = torch._utils._element_size(self.kv_cache_dtype)
+        cell = 2 * n_layers * kv_heads_local * head_dim * kv_bytes
+        if cell > 0:
+            logger.info(
+                "DFlash draft KV reserved in target pool: layers=%d, kv_heads_local=%d, "
+                "head_dim=%d, bytes=%d → %d B/token.",
+                n_layers, kv_heads_local, head_dim, kv_bytes, cell,
+            )
+        return cell
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config

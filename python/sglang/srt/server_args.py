@@ -984,8 +984,8 @@ class ServerArgs:
                 if self.speculative_algorithm == "STANDALONE":
                     # standalonedraft model and cuda graphs
                     reserved_mem += 6 * 1024
-                elif self.speculative_algorithm != "NGRAM":
-                    # eagle draft models and cuda graphs
+                elif self.speculative_algorithm not in ("NGRAM", "DFLASH"):
+                    # eagle draft models and cuda graphs (DFLASH accounts for its own draft allocations)
                     reserved_mem += 2 * 1024
 
             # For piecewise cuda graphs
@@ -2085,7 +2085,20 @@ class ServerArgs:
                     self.speculative_num_draft_tokens = getattr(draft_cfg, 'block_size', 12)
                 except Exception:
                     self.speculative_num_draft_tokens = 12
-            self.disable_overlap_schedule = True
+            # DFLASH spec-v2 (overlap) support is gated behind SGLANG_ENABLE_SPEC_V2.
+            # Default (no env): fall back to spec-v1 with overlap disabled — unchanged behavior.
+            if envs.SGLANG_ENABLE_SPEC_V2.get():
+                self.disable_overlap_schedule = False
+                logger.warning(
+                    "DFLASH spec v2 is enabled and overlap schedule is turned on (experimental)."
+                )
+            else:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "Overlap scheduler is disabled when using DFLASH speculative decoding. "
+                    "Set env SGLANG_ENABLE_SPEC_V2=True to "
+                    "enable the experimental overlap scheduler for DFLASH."
+                )
             self.enable_mixed_chunk = False
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):

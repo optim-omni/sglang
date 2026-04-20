@@ -63,13 +63,18 @@ class ChunkCache(BasePrefixCache):
             k1_total = (kv_committed_len - kernel_size) // kernel_stride + 1 if kv_committed_len >= kernel_size else 0
             if k1_total > 0:
                 k1_indices = self.req_to_token_pool.req_to_sparse_k1_token[req.req_pool_idx, :k1_total]
+                # Skip unallocated sentinel entries (slot 0 is the reserved dummy
+                # padding slot — only sparse attention backends allocate real k1
+                # slots; flashinfer / dense path leaves them at 0).
+                k1_indices = k1_indices[k1_indices != 0]
                 self.token_to_kv_pool_allocator.free(k1_indices)
 
             k2_kernel_size = kernel_size * 4
             k2_kernel_stride = kernel_stride * 4
-            k2_total = (kv_committed_len - k2_kernel_size) // k2_kernel_stride + 1 if kv_committed_len >= k2_kernel_size else 0
-            if k2_total > 0:
-                k2_indices = self.req_to_token_pool.req_to_sparse_k2_token[req.req_pool_idx, :k2_total]
+            k2_indices_total = (kv_committed_len - k2_kernel_size) // k2_kernel_stride + 1 if kv_committed_len >= k2_kernel_size else 0
+            if k2_indices_total > 0:
+                k2_indices = self.req_to_token_pool.req_to_sparse_k2_token[req.req_pool_idx, :k2_indices_total]
+                k2_indices = k2_indices[k2_indices != 0]
                 self.token_to_kv_pool_allocator.free(k2_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):

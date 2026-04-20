@@ -55,7 +55,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -66,6 +66,7 @@ logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 
@@ -742,6 +743,72 @@ class KVCache(abc.ABC):
         return self.custom_mem_pool
 
 
+def _set_kv_buffer_prefix_valid_impl(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    loc_2d: torch.Tensor,
+    commit_lens: torch.Tensor,
+    row_dim: int,
+    store_dtype: torch.dtype,
+) -> None:
+    """DFLASH spec-v2 helper: copy draft KV rows into cache only for the accepted prefix per batch row.
+
+    `loc_2d` shape [bs, draft_token_num]; `commit_lens[b]` tells how many rows of row b are accepted.
+    """
+    if k.numel() == 0 or loc_2d.numel() == 0 or commit_lens.numel() == 0:
+        return
+
+    if not k.is_contiguous():
+        k = k.contiguous()
+    if not v.is_contiguous():
+        v = v.contiguous()
+    if not loc_2d.is_contiguous():
+        loc_2d = loc_2d.contiguous()
+    if not commit_lens.is_contiguous():
+        commit_lens = commit_lens.contiguous()
+
+    # store_dtype is a torch.dtype; bytes per element via scratch tensor (portable across torch versions)
+    row_bytes = int(row_dim) * int(torch.tensor([], dtype=store_dtype).element_size())
+    if row_bytes <= 0:
+        return
+
+    if row_bytes >= 8192:
+        bytes_per_tile = 512
+        num_warps = 8
+    elif row_bytes >= 4096:
+        bytes_per_tile = 256
+        num_warps = 4
+    else:
+        bytes_per_tile = 128
+        num_warps = 4
+
+    grid = (
+        int(loc_2d.shape[0]),
+        int(loc_2d.shape[1]),
+        triton.cdiv(row_bytes, bytes_per_tile),
+    )
+
+    set_kv_buffer_prefix_valid_tiled[grid](
+        k,
+        v,
+        k_cache,
+        v_cache,
+        loc_2d,
+        commit_lens,
+        int(k.stride(0) * k.element_size()),
+        int(v.stride(0) * v.element_size()),
+        int(k_cache.stride(0) * k_cache.element_size()),
+        int(v_cache.stride(0) * v_cache.element_size()),
+        int(loc_2d.shape[1]),
+        ROW_BYTES=row_bytes,
+        BYTES_PER_TILE=bytes_per_tile,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+
+
 class MHATokenToKVPool(KVCache):
 
     def __init__(
@@ -1031,6 +1098,107 @@ class MHATokenToKVPool(KVCache):
         else:
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
             self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+
+    def set_kv_buffer_prefix_valid(
+        self,
+        layer: RadixAttention,
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        """DFLASH spec-v2: write `commit_lens[i]` rows of the i-th draft block into the cache.
+
+        `loc_2d` is a [bs, draft_token_num] tensor of KV cache slot indices; only the first
+        `commit_lens[i]` slots per row are written with data from `cache_k`/`cache_v`.
+        Unused slots (i.e. indices after `commit_lens[i]` in each row) are left untouched,
+        so callers must have already freed or recycled them via the allocator.
+        """
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+
+        if loc_2d.ndim != 2:
+            raise ValueError(
+                f"DFLASH loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}."
+            )
+        if commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
+            raise ValueError(
+                "DFLASH commit_lens shape mismatch: "
+                f"{tuple(commit_lens.shape)=} {tuple(loc_2d.shape)=}."
+            )
+
+        num_rows = int(loc_2d.numel())
+        if cache_k.shape[0] != num_rows or cache_v.shape[0] != num_rows:
+            raise ValueError(
+                "DFLASH cache_k/cache_v row count must match loc_2d: "
+                f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
+            )
+
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.contiguous().view(self.store_dtype)
+            cache_v = cache_v.contiguous().view(self.store_dtype)
+        else:
+            cache_k = cache_k.contiguous()
+            cache_v = cache_v.contiguous()
+
+        k_cache = self.k_buffer[layer_id - self.start_layer]
+        v_cache = self.v_buffer[layer_id - self.start_layer]
+
+        target_device = k_cache.device
+        if loc_2d.device != target_device:
+            loc_2d = loc_2d.to(device=target_device, non_blocking=True)
+        if commit_lens.device != target_device:
+            commit_lens = commit_lens.to(device=target_device, non_blocking=True)
+        if loc_2d.dtype != torch.int64:
+            loc_2d = loc_2d.to(torch.int64)
+        if commit_lens.dtype != torch.int32:
+            commit_lens = commit_lens.to(torch.int32)
+
+        # Fallback for non-CUDA/HIP: expand the valid prefix and reuse set_kv_buffer.
+        if not (_is_cuda or _is_hip):
+            row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+            valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
+            valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
+            if valid_idx.numel() == 0:
+                return
+            self.set_kv_buffer(
+                layer,
+                loc_2d.reshape(-1).index_select(0, valid_idx),
+                cache_k.index_select(0, valid_idx),
+                cache_v.index_select(0, valid_idx),
+                k_scale=None,
+                v_scale=None,
+                layer_id_override=layer_id,
+            )
+            return
+
+        # Row byte stride (last two dims of [size, head_num, head_dim] flattened per row).
+        row_dim = 1
+        for d in k_cache.shape[1:]:
+            row_dim *= int(d)
+        _set_kv_buffer_prefix_valid_impl(
+            k=cache_k,
+            v=cache_v,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            loc_2d=loc_2d,
+            commit_lens=commit_lens,
+            row_dim=row_dim,
+            store_dtype=self.store_dtype,
+        )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
@@ -2029,6 +2197,57 @@ def move_kv_cache_native(
     for k_cache, v_cache in zip(k_buffer, v_buffer):
         k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
         v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
+
+
+@triton.jit
+def set_kv_buffer_prefix_valid_tiled(
+    src_k_ptr,
+    src_v_ptr,
+    dst_k_ptr,
+    dst_v_ptr,
+    loc_2d_ptr,
+    commit_len_ptr,
+    src_k_row_stride,
+    src_v_row_stride,
+    dst_k_row_stride,
+    dst_v_row_stride,
+    block_size,
+    ROW_BYTES: tl.constexpr,
+    BYTES_PER_TILE: tl.constexpr,
+):
+    """DFLASH spec-v2: write the committed prefix of each batch row into a scattered KV cache.
+
+    One program instance handles one (batch_row, in-row position, byte-tile) triple;
+    rows with position >= commit_len[batch_row] short-circuit and exit.
+    """
+    bid = tl.program_id(0)
+    row = tl.program_id(1)
+    tid = tl.program_id(2)
+
+    commit_len = tl.load(commit_len_ptr + bid)
+    if row >= commit_len:
+        return
+
+    byte_off = tid * BYTES_PER_TILE + tl.arange(0, BYTES_PER_TILE)
+    mask_byte = byte_off < ROW_BYTES
+
+    loc = tl.load(loc_2d_ptr + bid * block_size + row)
+    src_row = bid * block_size + row
+
+    src_k_u8 = tl.cast(src_k_ptr, tl.pointer_type(tl.uint8))
+    src_v_u8 = tl.cast(src_v_ptr, tl.pointer_type(tl.uint8))
+    dst_k_u8 = tl.cast(dst_k_ptr, tl.pointer_type(tl.uint8))
+    dst_v_u8 = tl.cast(dst_v_ptr, tl.pointer_type(tl.uint8))
+
+    src_k_ptrs = src_k_u8 + src_row * src_k_row_stride + byte_off
+    src_v_ptrs = src_v_u8 + src_row * src_v_row_stride + byte_off
+    dst_k_ptrs = dst_k_u8 + loc * dst_k_row_stride + byte_off
+    dst_v_ptrs = dst_v_u8 + loc * dst_v_row_stride + byte_off
+
+    k_data = tl.load(src_k_ptrs, mask=mask_byte, other=0)
+    v_data = tl.load(src_v_ptrs, mask=mask_byte, other=0)
+    tl.store(dst_k_ptrs, k_data, mask=mask_byte)
+    tl.store(dst_v_ptrs, v_data, mask=mask_byte)
 
 
 @triton.jit

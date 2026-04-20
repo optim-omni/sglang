@@ -1,27 +1,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_verify_logits_adjustments,
     compute_dflash_accept_len_and_bonus,
     compute_dflash_sampling_accept_len_and_bonus,
     is_dflash_sampling_verify_available,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.tp_worker import TpModelWorker
 
 
 def _compute_paged_keep_slots(
@@ -250,6 +257,39 @@ class DFlashVerifyInput(SpecInput):
             else torch.empty((0,), dtype=torch.bool, device=batch.device)
         )
 
+    def prepare_for_v2_verify(
+        self,
+        batch: ModelWorkerBatch,
+        target_worker: "TpModelWorker",
+    ) -> tuple[ForwardBatch, bool]:
+        """Prepare a DFLASH verify ForwardBatch for spec-v2 overlap scheduling.
+
+        Unlike V1 `prepare_for_verify`, V2 callers have already computed and stored
+        `batch.out_cache_loc` via the draft block preparation kernel, so this method
+        only packages the ForwardBatch and primes either cuda-graph replay metadata
+        or eager attention metadata so that the actual target forward can run with
+        `skip_attn_backend_init=True`.
+        """
+        if not batch.forward_mode.is_idle():
+            batch.forward_mode = ForwardMode.TARGET_VERIFY
+        batch.input_ids = self.draft_token
+        batch.spec_info = self
+        batch.capture_hidden_mode = self.capture_hidden_mode
+
+        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+
+        can_run_cuda_graph = bool(
+            target_worker.model_runner.graph_runner
+            and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
+        )
+        if can_run_cuda_graph:
+            target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
+        elif not batch.forward_mode.is_idle():
+            target_worker.model_runner.attn_backend.init_forward_metadata(
+                verify_forward_batch
+            )
+        return verify_forward_batch, can_run_cuda_graph
+
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,
@@ -339,27 +379,13 @@ class DFlashVerifyInput(SpecInput):
                     f"len(sampling_info)={len(sampling_info)}, bs={bs}."
                 )
 
-            # Keep speculative verify semantics consistent with normal sampling path.
-            if sampling_info.has_custom_logit_processor:
-                apply_custom_logit_processor(
-                    logits_output.next_token_logits,
-                    sampling_info,
-                    num_tokens_in_batch=self.draft_token_num,
-                )
-
-            if (
-                sampling_info.penalizer_orchestrator.is_required
-                or sampling_info.logit_bias is not None
-            ):
-                linear_penalty = torch.zeros(
-                    (bs, logits_output.next_token_logits.shape[1]),
-                    dtype=torch.float32,
-                    device=device,
-                )
-                sampling_info.apply_logits_bias(linear_penalty)
-                logits_output.next_token_logits.add_(
-                    torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
-                )
+            # Unified helper also used by V2 verify path — keeps logit adjustments
+            # semantically identical between V1 (ScheduleBatch) and V2 (ModelWorkerBatch).
+            apply_dflash_verify_logits_adjustments(
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                draft_token_num=self.draft_token_num,
+            )
 
         candidates = self.draft_token.view(bs, self.draft_token_num)
         if (
@@ -367,10 +393,18 @@ class DFlashVerifyInput(SpecInput):
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
+            # Precompute top-k summary on CPU to avoid a GPU->CPU sync inside the hot path.
+            top_ks = [int(req.sampling_params.top_k) for req in batch.reqs]
             accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
+                max_top_k=max(max(top_ks), 1) if top_ks else 1,
+                uniform_top_k_value=(
+                    top_ks[0]
+                    if top_ks and all(top_k == top_ks[0] for top_k in top_ks)
+                    else None
+                ),
             )
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
@@ -517,59 +551,6 @@ class DFlashVerifyInput(SpecInput):
             batch.out_cache_loc,
             bs,
         )
-
-        # Allocate sparse k1/k2 tokens for newly committed positions so that
-        # cache_finished_req can free them correctly (H3 KV pool leak fix).
-        _rtp = batch.req_to_token_pool
-        if hasattr(_rtp, "kernel_size") and hasattr(_rtp, "kernel_stride"):
-            _ks1 = _rtp.kernel_size
-            _kst1 = _rtp.kernel_stride
-            _ks2 = _ks1 * 4
-            _kst2 = _kst1 * 4
-            total_new_k1 = 0
-            total_new_k2 = 0
-            new_k1_per_req = []
-            new_k2_per_req = []
-            for i in range(bs):
-                s = int(batch.seq_lens[i].item())
-                c = commit_lens_cpu[i]
-                s_new = s + c
-                k1_before = (s - _ks1) // _kst1 + 1 if s >= _ks1 else 0
-                k1_after = (s_new - _ks1) // _kst1 + 1 if s_new >= _ks1 else 0
-                nk1 = k1_after - k1_before
-                k2_before = (s - _ks2) // _kst2 + 1 if s >= _ks2 else 0
-                k2_after = (s_new - _ks2) // _kst2 + 1 if s_new >= _ks2 else 0
-                nk2 = k2_after - k2_before
-                new_k1_per_req.append(nk1)
-                new_k2_per_req.append(nk2)
-                total_new_k1 += nk1
-                total_new_k2 += nk2
-            if total_new_k1 > 0:
-                k1_loc = alloc_token_slots(batch.tree_cache, total_new_k1)
-                pt = 0
-                for i in range(bs):
-                    nk1 = new_k1_per_req[i]
-                    if nk1 > 0:
-                        s = int(batch.seq_lens[i].item())
-                        k1_before = (s - _ks1) // _kst1 + 1 if s >= _ks1 else 0
-                        _rtp.req_to_sparse_k1_token[
-                            batch.req_pool_indices[i],
-                            k1_before : k1_before + nk1,
-                        ] = k1_loc[pt : pt + nk1].to(torch.int32)
-                        pt += nk1
-            if total_new_k2 > 0:
-                k2_loc = alloc_token_slots(batch.tree_cache, total_new_k2)
-                pt = 0
-                for i in range(bs):
-                    nk2 = new_k2_per_req[i]
-                    if nk2 > 0:
-                        s = int(batch.seq_lens[i].item())
-                        k2_before = (s - _ks2) // _kst2 + 1 if s >= _ks2 else 0
-                        _rtp.req_to_sparse_k2_token[
-                            batch.req_pool_indices[i],
-                            k2_before : k2_before + nk2,
-                        ] = k2_loc[pt : pt + nk2].to(torch.int32)
-                        pt += nk2
 
         # Update batch seq lens.
         batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
